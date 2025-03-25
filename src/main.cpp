@@ -1,130 +1,113 @@
-/*******************************************************************
-    A touch screen test for the ESP32 Cheap Yellow Display.
-
-    https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display
-
-    If you find what I do useful and would like to support me,
-    please consider becoming a sponsor on Github
-    https://github.com/sponsors/witnessmenow/
-
-    Written by Brian Lough
-    YouTube: https://www.youtube.com/brianlough
-    Twitter: https://twitter.com/witnessmenow
- *******************************************************************/
-
-// Make sure to copy the UserSetup.h file into the library as
-// per the Github Instructions. The pins are defined in there.
-
-// ----------------------------
-// Standard Libraries
-// ----------------------------
 #include <Arduino.h>
-
-#include <SPI.h>
-
-// ----------------------------
-// Additional Libraries - each one of these will need to be installed.
-// ----------------------------
-
-#include <XPT2046_Touchscreen.h>
-// A library for interfacing with the touch screen
-//
-// Can be installed from the library manager (Search for "XPT2046")
-//https://github.com/PaulStoffregen/XPT2046_Touchscreen
-
 #include <TFT_eSPI.h>
-// A library for interfacing with LCD displays
-//
-// Can be installed from the library manager (Search for "TFT_eSPI")
-//https://github.com/Bodmer/TFT_eSPI
+#include <XPT2046_Touchscreen.h>
+#include <lvgl.h>
 
 
-// ----------------------------
-// Touch Screen pins
-// ----------------------------
-
-// The CYD touch uses some non default
-// SPI pins
-
-#define XPT2046_IRQ 36
+#define XPT2046_IRQ  36
 #define XPT2046_MOSI 32
 #define XPT2046_MISO 39
-#define XPT2046_CLK 25
-#define XPT2046_CS 33
-
-// ----------------------------
+#define XPT2046_CLK  25
+#define XPT2046_CS   33
 
 SPIClass mySpi = SPIClass(VSPI);
 XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
 
-TFT_eSPI tft = TFT_eSPI();
+TFT_eSPI tft = TFT_eSPI(); // Display
+
+
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf1[320 * 10]; // Example: 10 lines of 320 pixels each
+
+
+void my_disp_flush_cb(lv_disp_drv_t * disp, const lv_area_t * area, lv_color_t * color_p)
+{
+
+  int32_t w = (area->x2 - area->x1 + 1);
+  int32_t h = (area->y2 - area->y1 + 1);
+
+
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.pushPixels((uint16_t *)&color_p[0], w * h);
+  tft.endWrite();
+
+  // Tell LVGL we're done
+  lv_disp_flush_ready(disp);
+}
+
+
+
+static void my_touch_read_cb(lv_indev_drv_t * indev, lv_indev_data_t * data)
+{
+  // Check if touched
+  if (ts.tirqTouched() && ts.touched())
+  {
+    TS_Point p = ts.getPoint();
+    // Map raw to screen (adjust raw min/max to your panel)
+    int screenX = map(p.x, 200, 3800, 0, 320);
+    int screenY = map(p.y, 240, 3800, 0, 240);
+
+    // In some rotations you might invert axes or swap X<->Y
+    // e.g. screenX = 320 - screenX; etc. if it appears mirrored
+
+    data->point.x = screenX;
+    data->point.y = screenY;
+    data->state   = LV_INDEV_STATE_PR; // pressed
+  }
+  else
+  {
+    data->state = LV_INDEV_STATE_REL; // not pressed
+  }
+}
+
+
 
 void setup() {
   Serial.begin(115200);
 
-  // Start the SPI for the touch screen and init the TS library
+  // Initialize the TFT
+  tft.init();
+  tft.setRotation(1); // e.g. landscape
+
+  // Initialize the Touch
   mySpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   ts.begin(mySpi);
-  ts.setRotation(1);
+  ts.setRotation(1); // match orientation
 
-  // Start the tft display and set it to black
-  tft.init();
-  tft.setRotation(1); //This is the display in landscape
+  // Initialize LVGL
+  lv_init();
 
-  // Clear the screen before writing to it
-  tft.fillScreen(TFT_BLACK);
+  // Create a draw buffer (we'll do single buffering here)
+  lv_disp_draw_buf_init(&draw_buf, buf1, NULL, 320 * 10);
 
-  int x = 320 / 2; // center of display
-  int y = 100;
-  int fontSize = 2;
-  tft.drawCentreString("Touch Screen to Start", x, y, fontSize);
+  // Register display driver
+  static lv_disp_drv_t disp_drv; // Must be static or global
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = 320;
+  disp_drv.ver_res = 240;
+  disp_drv.flush_cb = my_disp_flush_cb;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+
+  // Register input driver (touch)
+  static lv_indev_drv_t indev_drv;
+  lv_indev_drv_init(&indev_drv);
+  indev_drv.type = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb = my_touch_read_cb;
+  lv_indev_drv_register(&indev_drv);
+
+
+  lv_obj_t * label = lv_label_create(lv_scr_act());
+  lv_label_set_text(label, "Hello LVGL");
+  lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
 }
 
-void printTouchToSerial(TS_Point p) {
-  Serial.print("Pressure = ");
-  Serial.print(p.z);
-  Serial.print(", x = ");
-  Serial.print(p.x);
-  Serial.print(", y = ");
-  Serial.print(p.y);
-  Serial.println();
-}
-
-void printTouchToDisplay(TS_Point p) {
-
-  // Clear screen first
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-
-  int x = 320 / 2; // center of display
-  int y = 100;
-  int fontSize = 2;
-
-  String temp = "Pressure = " + String(p.z);
-  tft.drawCentreString(temp, x, y, fontSize);
-
-  y += 16;
-  temp = "X = " + String(p.x);
-  tft.drawCentreString(temp, x, y, fontSize);
-
-  y += 16;
-  temp = "Y = " + String(p.y);
-  tft.drawCentreString(temp, x, y, fontSize);
-}
 
 void loop() {
-  if (ts.tirqTouched() && ts.touched()) {
-    TS_Point p = ts.getPoint();
-    int screenX = map(p.x, 200, 3800, 0, 320);  // Adjust 200..3800 to your actual raw range
-    int screenY = map(p.y, 240, 3800, 0, 240);  // Same here, and 320x240 if your display is that size
+  
+  lv_timer_handler();  
+  delay(5);            
+  tft.drawCircle(160, 120, 50, TFT_RED);
 
-    // Draw a circle at that position
-    // (Use fillCircle if you want a filled circle)
-    tft.fillCircle(screenX,screenY, 10, TFT_RED);
-    delay(500);
-    printTouchToSerial(p);
-    printTouchToDisplay(p);
-    delay(100);
-
-  }
 }
