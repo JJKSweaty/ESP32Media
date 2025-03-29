@@ -2,6 +2,7 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <lvgl.h>
+#include "UI/ui.h"
 
 // --- Touchscreen pin definitions ---
 #define XPT2046_IRQ  36  // Touch interrupt
@@ -133,8 +134,8 @@ void setup() {
   indev_drv.type = LV_INDEV_TYPE_POINTER;
   indev_drv.read_cb = touchscreen_read;
   lv_indev_drv_register(&indev_drv);
-
-  create_tabview_gui();
+  tft.invertDisplay(false);
+  ui_init();
   
   
 }
