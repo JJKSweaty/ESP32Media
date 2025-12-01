@@ -7,7 +7,9 @@
 
 #include "ui.h"
 #include "data_model.h"
+#include "wifi_manager.h"
 #include <math.h>
+#include <WiFi.h>
 
 // --- Styles ---
 static lv_style_t style_screen_bg;
@@ -53,6 +55,11 @@ struct MusicUI {
     lv_obj_t *queue_title;      // Queue page title
     lv_obj_t *queue_list;       // List widget for queue items
     lv_obj_t *playlist_label;   // Current playlist name on queue page
+    // Local progress interpolation
+    int last_server_position;   // Last position from server
+    int last_server_duration;   // Last duration from server
+    uint32_t last_update_ms;    // Timestamp of last server update
+    int interpolated_position;  // Smoothly interpolated position
 };
 static MusicUI musicUi;
 
@@ -60,43 +67,41 @@ static MusicUI musicUi;
 static char gLastQueueItems[MAX_QUEUE_ITEMS][MAX_STR_ESP];
 static uint8_t gLastQueueLen = 255;
 
+// Command buffer size (must match data_model.h)
+#define CMD_MAX_LEN 128
+
 // Kill button callback for process list
 static void kill_proc_event_cb(lv_event_t *e) {
     // Get the label passed as user_data
     lv_obj_t *label = (lv_obj_t *)lv_event_get_user_data(e);
     
     if (label && lv_obj_check_type(label, &lv_label_class)) {
-        const char *txt = lv_label_get_text(label);
         // Try to read PID from label's user data (preferred)
         int pid = 0;
         void *ud = lv_obj_get_user_data(label);
         if (ud) pid = (int)(intptr_t)ud;
-        Serial.print("[UI] Kill requested for: ");
-        Serial.println(txt);
-        // Parse a PID at the start like "1234: ..."
-        if (pid == 0 && txt) {
-            // find colon
-            const char *colon = strchr(txt, ':');
-            if (colon) {
-                // parse integer before colon
-                char buf[16];
-                int n = colon - txt;
-                if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
-                memcpy(buf, txt, n);
-                buf[n] = '\0';
-                pid = atoi(buf);
+        
+        // Parse a PID at the start like "1234: ..." if user_data is empty
+        if (pid == 0) {
+            const char *txt = lv_label_get_text(label);
+            if (txt) {
+                const char *colon = strchr(txt, ':');
+                if (colon) {
+                    char buf[16];
+                    int n = colon - txt;
+                    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+                    memcpy(buf, txt, n);
+                    buf[n] = '\0';
+                    pid = atoi(buf);
+                }
             }
         }
         if (pid > 0) {
-            // Send JSON command over serial to host: {"cmd":"kill","pid":1234}\n
-            char out[64];
+            // Send JSON command to Python server
+            char out[CMD_MAX_LEN];
             snprintf(out, sizeof(out), "{\"cmd\":\"kill\",\"pid\":%d}\n", pid);
-            Serial.print(out);
-        } else {
-            Serial.println("[UI] Could not parse PID from label.");
+            send_command(out);
         }
-    } else {
-        Serial.println("[UI] Could not find process label.");
     }
 }
 
@@ -128,36 +133,90 @@ static void update_artwork() {
     Serial.println("[UI] Artwork displayed");
 }
 
+// Debounce for play button to prevent jitter
+static uint32_t gLastPlayPressMs = 0;
+static const uint32_t PLAY_DEBOUNCE_MS = 400;  // Ignore presses within 400ms
+
 static void play_event_cb(lv_event_t *e) {
     (void)e;
-    // Toggle play/pause - send the appropriate command based on current state
-    const char *cmd = musicUi.is_playing ? "{\"cmd\":\"pause\"}\n" : "{\"cmd\":\"play\"}\n";
-    Serial.print(cmd);
+    
+    // Debounce - ignore rapid presses
+    uint32_t now = lv_tick_get();
+    if (now - gLastPlayPressMs < PLAY_DEBOUNCE_MS) {
+        return;
+    }
+    gLastPlayPressMs = now;
+    
+    // Toggle play/pause locally for immediate UX feedback
+    musicUi.is_playing = !musicUi.is_playing;
+    if (musicUi.play_pause_label) {
+        lv_label_set_text(musicUi.play_pause_label, musicUi.is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    }
+    // Send the appropriate command based on current state
+    const char *cmd = musicUi.is_playing ? "{\"cmd\":\"play\"}\n" : "{\"cmd\":\"pause\"}\n";
+    send_command(cmd);
 }
+
+// Debounce for next/prev buttons
+static uint32_t gLastNavPressMs = 0;
+static const uint32_t NAV_DEBOUNCE_MS = 300;
 
 static void next_event_cb(lv_event_t *e) {
     (void)e;
-    const char *cmd = "{\"cmd\":\"next\"}\n";
-    Serial.print(cmd);
+    uint32_t now = lv_tick_get();
+    if (now - gLastNavPressMs < NAV_DEBOUNCE_MS) return;
+    gLastNavPressMs = now;
+    send_command("{\"cmd\":\"next\"}\n");
 }
 
 static void prev_event_cb(lv_event_t *e) {
     (void)e;
-    const char *cmd = "{\"cmd\":\"previous\"}\n";
-    Serial.print(cmd);
+    uint32_t now = lv_tick_get();
+    if (now - gLastNavPressMs < NAV_DEBOUNCE_MS) return;
+    gLastNavPressMs = now;
+    send_command("{\"cmd\":\"previous\"}\n");
 }
+
+// Debounce for queue item clicks
+static uint32_t gLastQueueClickMs = 0;
+static const uint32_t QUEUE_CLICK_DEBOUNCE_MS = 500;
 
 // Queue item click - play this track immediately
 static void queue_item_click_cb(lv_event_t *e) {
-    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
-    void *ud = lv_obj_get_user_data(btn);
+    // Debounce
+    uint32_t now = lv_tick_get();
+    if (now - gLastQueueClickMs < QUEUE_CLICK_DEBOUNCE_MS) {
+        return;
+    }
+    gLastQueueClickMs = now;
+    
+    // Use current target (object the callback was attached to) for reliable userdata
+    lv_obj_t *obj = (lv_obj_t *)lv_event_get_current_target(e);
+    // Fallback to event target if needed
+    if (!obj) obj = (lv_obj_t *)lv_event_get_target(e);
+
+    // The play button should have user_data set directly
+    void *ud = lv_obj_get_user_data(obj);
+    
+    // If not found, try parent (in case label was clicked)
+    if (!ud && obj) {
+        lv_obj_t *parent = lv_obj_get_parent(obj);
+        if (parent) ud = lv_obj_get_user_data(parent);
+    }
+    
     if (ud) {
         int idx = (int)(intptr_t)ud;
-        char out[64];
+        Serial.print("[UI] Queue play clicked, index=");
+        Serial.println(idx);
+        char out[CMD_MAX_LEN];
         snprintf(out, sizeof(out), "{\"cmd\":\"queue_action\",\"action\":\"play_now\",\"index\":%d}\n", idx);
-        Serial.print(out);
+        send_command(out);
+    } else {
+        Serial.println("[UI] Queue play clicked but no userdata found");
     }
 }
+
+// ========== QUEUE REORDER WITH UP/DOWN ARROWS ==========
 
 // Navigate to queue page
 static void show_queue_page_cb(lv_event_t *e) {
@@ -268,39 +327,43 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_add_style(title, &style_label_primary, 0);
     lv_label_set_text(title, "No media playing");
     lv_label_set_long_mode(title, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(title, 210);
+    lv_obj_set_width(title, 180);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 90, 5);
 
-    // Artist
+    // Artist (scrolling single line)
     lv_obj_t *artist = lv_label_create(card);
     lv_obj_add_style(artist, &style_label_secondary, 0);
     lv_label_set_text(artist, "Artist");
-    lv_obj_set_width(artist, 210);
+    lv_label_set_long_mode(artist, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(artist, 180);
     lv_obj_align(artist, LV_ALIGN_TOP_LEFT, 90, 28);
 
-    // Album
+    // Album (scrolling single line)
     lv_obj_t *album = lv_label_create(card);
     lv_obj_add_style(album, &style_label_secondary, 0);
     lv_label_set_text(album, "Album");
-    lv_obj_set_width(album, 210);
+    lv_label_set_long_mode(album, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(album, 180);
     lv_obj_align(album, LV_ALIGN_TOP_LEFT, 90, 50);
 
-    // Queue button - top right corner of card
+    // Queue button - hamburger menu style (≡) positioned below album art
     lv_obj_t *queue_btn = lv_btn_create(card);
-    lv_obj_set_size(queue_btn, 70, 26);
-    lv_obj_align(queue_btn, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_size(queue_btn, 80, 24);
+    lv_obj_align(queue_btn, LV_ALIGN_TOP_LEFT, 0, 85);  // Below artwork
     lv_obj_set_style_bg_color(queue_btn, lv_color_hex(0x303050), 0);
+    lv_obj_set_style_radius(queue_btn, 4, 0);
     lv_obj_t *queue_btn_label = lv_label_create(queue_btn);
-    lv_label_set_text(queue_btn_label, "Queue " LV_SYMBOL_RIGHT);
+    // Use three horizontal lines icon (hamburger menu style)
+    lv_label_set_text(queue_btn_label, LV_SYMBOL_LIST " Queue");
     lv_obj_set_style_text_font(queue_btn_label, &lv_font_montserrat_12, 0);
     lv_obj_center(queue_btn_label);
     lv_obj_add_event_cb(queue_btn, show_queue_page_cb, LV_EVENT_CLICKED, NULL);
     musicUi.queue_btn = queue_btn;
 
-    // Progress bar - positioned above controls
+    // Progress bar - positioned above controls (card is 185px, controls at bottom)
     lv_obj_t *bar = lv_bar_create(card);
     lv_obj_set_size(bar, 290, 8);
-    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -55);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -42);
     lv_bar_set_range(bar, 0, 100);
     lv_bar_set_value(bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x303050), LV_PART_MAIN);
@@ -312,7 +375,7 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_t *time_label = lv_label_create(card);
     lv_obj_add_style(time_label, &style_label_secondary, 0);
     lv_label_set_text(time_label, "0:00 / 0:00");
-    lv_obj_align(time_label, LV_ALIGN_BOTTOM_MID, 0, -38);
+    lv_obj_align(time_label, LV_ALIGN_BOTTOM_MID, 0, -52);
 
     musicUi.art_container = art_container;
     musicUi.art_img = art_img;
@@ -327,7 +390,7 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_t *controls = lv_obj_create(card);
     lv_obj_remove_style_all(controls);
     lv_obj_set_size(controls, 200, 30);
-    lv_obj_align(controls, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_align(controls, LV_ALIGN_BOTTOM_MID, 0, -5);
     lv_obj_set_layout(controls, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(controls, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(controls, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -535,25 +598,400 @@ static void build_discord_tab(lv_obj_t *parent) {
     lv_obj_center(label);
 }
 
-// --- SETTINGS TAB ---
+// --- SETTINGS TAB with Network Info ---
+// Settings UI holder
+struct SettingsUI {
+    lv_obj_t *wifi_status_label;
+    lv_obj_t *wifi_ip_label;
+    lv_obj_t *server_status_label;
+    lv_obj_t *ssid_label;
+    lv_obj_t *rssi_label;
+    lv_obj_t *scan_btn;
+    lv_obj_t *network_list;
+    lv_obj_t *password_textarea;
+    lv_obj_t *connect_btn;
+    lv_obj_t *keyboard;
+    lv_obj_t *password_popup;
+    char selected_ssid[33];
+    bool scan_pending;
+};
+static SettingsUI settingsUi;
+
+// Forward declarations for settings callbacks
+static void wifi_scan_btn_cb(lv_event_t *e);
+static void network_item_click_cb(lv_event_t *e);
+static void password_connect_cb(lv_event_t *e);
+static void password_cancel_cb(lv_event_t *e);
+static void keyboard_event_cb(lv_event_t *e);
+static void update_wifi_status_display();
+static void update_network_list();
+
+// Password popup for connecting to networks
+static void show_password_popup(const char* ssid) {
+    strncpy(settingsUi.selected_ssid, ssid, 32);
+    settingsUi.selected_ssid[32] = '\0';
+    
+    // Create fullscreen overlay for keyboard popup
+    lv_obj_t *popup = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(popup, 320, 240);
+    lv_obj_set_pos(popup, 0, 0);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x0d0d1a), 0);
+    lv_obj_set_style_bg_opa(popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(popup, 0, 0);
+    lv_obj_set_style_radius(popup, 0, 0);
+    lv_obj_set_style_pad_all(popup, 5, 0);
+    lv_obj_remove_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+    settingsUi.password_popup = popup;
+    
+    // Title - compact at top
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text_fmt(title, LV_SYMBOL_WIFI " %s", ssid);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x1db954), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(title, 300);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Password input - below title
+    lv_obj_t *ta = lv_textarea_create(popup);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_password_mode(ta, true);
+    lv_textarea_set_placeholder_text(ta, "Enter password...");
+    lv_obj_set_size(ta, 240, 32);
+    lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x1a1a2e), 0);
+    lv_obj_set_style_border_color(ta, lv_color_hex(0x1db954), 0);
+    lv_obj_set_style_text_color(ta, lv_color_hex(0xffffff), 0);
+    settingsUi.password_textarea = ta;
+    
+    // Buttons row - next to text area
+    lv_obj_t *cancel_btn = lv_button_create(popup);
+    lv_obj_set_size(cancel_btn, 70, 28);
+    lv_obj_align(cancel_btn, LV_ALIGN_TOP_LEFT, 5, 58);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(cancel_btn, 4, 0);
+    lv_obj_add_event_cb(cancel_btn, password_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE " Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_10, 0);
+    lv_obj_center(cancel_lbl);
+    
+    lv_obj_t *connect_btn = lv_button_create(popup);
+    lv_obj_set_size(connect_btn, 70, 28);
+    lv_obj_align(connect_btn, LV_ALIGN_TOP_RIGHT, -5, 58);
+    lv_obj_set_style_bg_color(connect_btn, lv_color_hex(0x1db954), 0);
+    lv_obj_set_style_radius(connect_btn, 4, 0);
+    lv_obj_add_event_cb(connect_btn, password_connect_cb, LV_EVENT_CLICKED, NULL);
+    settingsUi.connect_btn = connect_btn;
+    lv_obj_t *connect_lbl = lv_label_create(connect_btn);
+    lv_label_set_text(connect_lbl, LV_SYMBOL_OK " Join");
+    lv_obj_set_style_text_font(connect_lbl, &lv_font_montserrat_10, 0);
+    lv_obj_center(connect_lbl);
+    
+    // Keyboard - fills bottom area
+    lv_obj_t *kb = lv_keyboard_create(popup);
+    lv_obj_set_size(kb, 310, 145);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_obj_set_style_bg_color(kb, lv_color_hex(0x1a1a2e), 0);
+    lv_obj_set_style_bg_color(kb, lv_color_hex(0x252540), LV_PART_ITEMS);
+    lv_obj_set_style_text_color(kb, lv_color_hex(0xffffff), LV_PART_ITEMS);
+    // Handle checkmark (enter) and cancel keys
+    lv_obj_add_event_cb(kb, keyboard_event_cb, LV_EVENT_READY, NULL);  // Checkmark pressed
+    lv_obj_add_event_cb(kb, keyboard_event_cb, LV_EVENT_CANCEL, NULL); // X pressed
+    settingsUi.keyboard = kb;
+}
+
+// Keyboard event handler for checkmark/cancel
+static void keyboard_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY) {
+        // Checkmark pressed - connect
+        password_connect_cb(e);
+    } else if (code == LV_EVENT_CANCEL) {
+        // X pressed - cancel
+        password_cancel_cb(e);
+    }
+}
+
+static void password_cancel_cb(lv_event_t *e) {
+    (void)e;
+    if (settingsUi.password_popup) {
+        lv_obj_delete(settingsUi.password_popup);
+        settingsUi.password_popup = NULL;
+    }
+}
+
+static void password_connect_cb(lv_event_t *e) {
+    (void)e;
+    const char* password = lv_textarea_get_text(settingsUi.password_textarea);
+    
+    // Connect to network
+    if (wifiMgr.connect(settingsUi.selected_ssid, password, true)) {
+        // Connected successfully
+        Serial.printf("[UI] Connected to %s\n", settingsUi.selected_ssid);
+    } else {
+        Serial.printf("[UI] Failed to connect to %s\n", settingsUi.selected_ssid);
+    }
+    
+    // Close popup
+    password_cancel_cb(e);
+    
+    // Update status display
+    update_wifi_status_display();
+}
+
+static void wifi_scan_btn_cb(lv_event_t *e) {
+    (void)e;
+    lv_label_set_text(lv_obj_get_child(settingsUi.scan_btn, 0), "Scanning...");
+    lv_refr_now(NULL);  // Force immediate UI refresh to show "Scanning..."
+    
+    wifiMgr.startScan();  // Synchronous scan - blocks until complete
+    
+    lv_label_set_text(lv_obj_get_child(settingsUi.scan_btn, 0), LV_SYMBOL_REFRESH " Scan Networks");
+    update_network_list();
+    settingsUi.scan_pending = false;
+}
+
+static void network_item_click_cb(lv_event_t *e) {
+    lv_obj_t *btn = (lv_obj_t*)lv_event_get_target(e);
+    const char* ssid = (const char*)lv_obj_get_user_data(btn);
+    
+    if (ssid) {
+        // Check if this is a saved network
+        char password[65];
+        if (wifiMgr.findSavedPassword(ssid, password, sizeof(password))) {
+            // Saved network - connect directly
+            if (wifiMgr.connect(ssid, password, false)) {
+                Serial.printf("[UI] Connected to saved network: %s\n", ssid);
+            }
+            update_wifi_status_display();
+        } else {
+            // New network - show password popup
+            show_password_popup(ssid);
+        }
+    }
+}
+
+static void update_network_list() {
+    if (!settingsUi.network_list) return;
+    
+    // Clear existing items
+    lv_obj_clean(settingsUi.network_list);
+    
+    NetworkInfo networks[10];
+    int count = wifiMgr.getScanResults(networks, 10);
+    
+    Serial.printf("[UI] Displaying %d networks\n", count);
+    
+    for (int i = 0; i < count; i++) {
+        Serial.printf("[UI] Network %d: %s (%d dBm)\n", i, networks[i].ssid, networks[i].rssi);
+        
+        lv_obj_t *btn = lv_button_create(settingsUi.network_list);
+        lv_obj_set_size(btn, 130, 22);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x252540), 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+        lv_obj_set_style_pad_all(btn, 2, 0);
+        
+        // Store SSID in user_data (static memory needed)
+        static char ssid_storage[10][33];
+        strncpy(ssid_storage[i], networks[i].ssid, 32);
+        ssid_storage[i][32] = '\0';
+        lv_obj_set_user_data(btn, ssid_storage[i]);
+        lv_obj_add_event_cb(btn, network_item_click_cb, LV_EVENT_CLICKED, NULL);
+        
+        // Network name with signal indicator
+        lv_obj_t *lbl = lv_label_create(btn);
+        char txt[48];
+        const char* saved = networks[i].saved ? "*" : "";
+        const char* signal = networks[i].rssi > -50 ? LV_SYMBOL_WIFI : 
+                            (networks[i].rssi > -70 ? LV_SYMBOL_WIFI : LV_SYMBOL_WIFI);
+        snprintf(txt, sizeof(txt), "%s%s %s", saved, signal, networks[i].ssid);
+        lv_label_set_text(lbl, txt);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(lbl, 120);
+        lv_obj_center(lbl);
+    }
+    
+    if (count == 0) {
+        lv_obj_t *lbl = lv_label_create(settingsUi.network_list);
+        lv_label_set_text(lbl, "No networks found");
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, 0);
+    }
+}
+
+static void update_wifi_status_display() {
+    if (!settingsUi.ssid_label) return;
+    
+    if (wifiMgr.isConnected()) {
+        String ssid = wifiMgr.getConnectedSSID();
+        char buf[64];
+        snprintf(buf, sizeof(buf), "SSID: %s", ssid.c_str());
+        lv_label_set_text(settingsUi.ssid_label, buf);
+        
+        lv_label_set_text(settingsUi.wifi_status_label, "WiFi: Connected");
+        lv_obj_set_style_text_color(settingsUi.wifi_status_label, lv_color_hex(0x1db954), 0);
+        
+        IPAddress ip = wifiMgr.getIP();
+        snprintf(buf, sizeof(buf), "IP: %s", ip.toString().c_str());
+        lv_label_set_text(settingsUi.wifi_ip_label, buf);
+        
+        int32_t rssi = wifiMgr.getRSSI();
+        snprintf(buf, sizeof(buf), "Signal: %ld dBm", rssi);
+        lv_label_set_text(settingsUi.rssi_label, buf);
+    } else {
+        lv_label_set_text(settingsUi.ssid_label, "SSID: Not connected");
+        lv_label_set_text(settingsUi.wifi_status_label, "WiFi: Disconnected");
+        lv_obj_set_style_text_color(settingsUi.wifi_status_label, lv_color_hex(0xff4444), 0);
+        lv_label_set_text(settingsUi.wifi_ip_label, "IP: ---.---.---.---");
+        lv_label_set_text(settingsUi.rssi_label, "Signal: -- dBm");
+    }
+}
+
 static void build_settings_tab(lv_obj_t *parent) {
     lv_obj_add_style(parent, &style_screen_bg, 0);
+    lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
     lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Main card
     lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_remove_style_all(card);
     lv_obj_add_style(card, &style_card, 0);
-    lv_obj_set_size(card, 300, 160);
-    lv_obj_center(card);
+    lv_obj_set_size(card, 310, 185);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 2);
 
+    // Title
     lv_obj_t *title = lv_label_create(card);
     lv_obj_add_style(title, &style_label_primary, 0);
-    lv_label_set_text(title, "Settings");
+    lv_label_set_text(title, LV_SYMBOL_SETTINGS " Settings");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    lv_obj_t *desc = lv_label_create(card);
-    lv_obj_add_style(desc, &style_label_secondary, 0);
-    lv_label_set_text(desc, "Theme, brightness,\nupdate interval...");
-    lv_obj_align(desc, LV_ALIGN_TOP_LEFT, 0, 25);
+    // ========== NETWORK SECTION ==========
+    lv_obj_t *net_section = lv_obj_create(card);
+    lv_obj_remove_style_all(net_section);
+    lv_obj_set_size(net_section, 145, 130);
+    lv_obj_align(net_section, LV_ALIGN_TOP_LEFT, 0, 25);
+    lv_obj_set_style_bg_color(net_section, lv_color_hex(0x151525), 0);
+    lv_obj_set_style_bg_opa(net_section, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(net_section, 6, 0);
+    lv_obj_set_style_pad_all(net_section, 6, 0);
+    lv_obj_remove_flag(net_section, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Network section title
+    lv_obj_t *net_title = lv_label_create(net_section);
+    lv_obj_add_style(net_title, &style_label_primary, 0);
+    lv_label_set_text(net_title, LV_SYMBOL_WIFI " WiFi Status");
+    lv_obj_set_style_text_font(net_title, &lv_font_montserrat_10, 0);
+    lv_obj_align(net_title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    // WiFi SSID (dynamic)
+    lv_obj_t *ssid_label = lv_label_create(net_section);
+    lv_obj_add_style(ssid_label, &style_label_secondary, 0);
+    lv_label_set_text(ssid_label, "SSID: Connecting...");
+    lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_10, 0);
+    lv_obj_align(ssid_label, LV_ALIGN_TOP_LEFT, 0, 14);
+    lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(ssid_label, 135);
+    settingsUi.ssid_label = ssid_label;
+
+    // WiFi status (connected/connecting/disconnected)
+    lv_obj_t *wifi_status = lv_label_create(net_section);
+    lv_obj_add_style(wifi_status, &style_label_secondary, 0);
+    lv_label_set_text(wifi_status, "WiFi: Connecting...");
+    lv_obj_set_style_text_font(wifi_status, &lv_font_montserrat_10, 0);
+    lv_obj_align(wifi_status, LV_ALIGN_TOP_LEFT, 0, 28);
+    settingsUi.wifi_status_label = wifi_status;
+
+    // IP Address
+    lv_obj_t *ip_label = lv_label_create(net_section);
+    lv_obj_add_style(ip_label, &style_label_secondary, 0);
+    lv_label_set_text(ip_label, "IP: ---.---.---.---");
+    lv_obj_set_style_text_font(ip_label, &lv_font_montserrat_10, 0);
+    lv_obj_align(ip_label, LV_ALIGN_TOP_LEFT, 0, 42);
+    settingsUi.wifi_ip_label = ip_label;
+
+    // Signal strength (RSSI)
+    lv_obj_t *rssi_label = lv_label_create(net_section);
+    lv_obj_add_style(rssi_label, &style_label_secondary, 0);
+    lv_label_set_text(rssi_label, "Signal: -- dBm");
+    lv_obj_set_style_text_font(rssi_label, &lv_font_montserrat_10, 0);
+    lv_obj_align(rssi_label, LV_ALIGN_TOP_LEFT, 0, 56);
+    settingsUi.rssi_label = rssi_label;
+
+    // Server connection status
+    lv_obj_t *server_status = lv_label_create(net_section);
+    lv_obj_add_style(server_status, &style_label_secondary, 0);
+    char server_txt[48];
+    snprintf(server_txt, sizeof(server_txt), "Server: %s", TCP_SERVER_IP);
+    lv_label_set_text(server_status, server_txt);
+    lv_obj_set_style_text_font(server_status, &lv_font_montserrat_10, 0);
+    lv_obj_align(server_status, LV_ALIGN_TOP_LEFT, 0, 70);
+    lv_label_set_long_mode(server_status, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(server_status, 135);
+    settingsUi.server_status_label = server_status;
+
+    // ========== NETWORK SELECTION SECTION ==========
+    lv_obj_t *scan_section = lv_obj_create(card);
+    lv_obj_remove_style_all(scan_section);
+    lv_obj_set_size(scan_section, 145, 130);
+    lv_obj_align(scan_section, LV_ALIGN_TOP_RIGHT, 0, 25);
+    lv_obj_set_style_bg_color(scan_section, lv_color_hex(0x151525), 0);
+    lv_obj_set_style_bg_opa(scan_section, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(scan_section, 6, 0);
+    lv_obj_set_style_pad_all(scan_section, 6, 0);
+    lv_obj_remove_flag(scan_section, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Scan section title with button
+    lv_obj_t *scan_btn = lv_button_create(scan_section);
+    lv_obj_set_size(scan_btn, 130, 20);
+    lv_obj_align(scan_btn, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(scan_btn, lv_color_hex(0x1db954), 0);
+    lv_obj_set_style_radius(scan_btn, 4, 0);
+    lv_obj_add_event_cb(scan_btn, wifi_scan_btn_cb, LV_EVENT_CLICKED, NULL);
+    settingsUi.scan_btn = scan_btn;
+    
+    lv_obj_t *scan_lbl = lv_label_create(scan_btn);
+    lv_label_set_text(scan_lbl, LV_SYMBOL_REFRESH " Scan Networks");
+    lv_obj_set_style_text_font(scan_lbl, &lv_font_montserrat_10, 0);
+    lv_obj_center(scan_lbl);
+
+    // Network list container
+    lv_obj_t *net_list = lv_obj_create(scan_section);
+    lv_obj_remove_style_all(net_list);
+    lv_obj_set_size(net_list, 135, 100);
+    lv_obj_align(net_list, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_set_style_bg_color(net_list, lv_color_hex(0x0d0d1a), 0);
+    lv_obj_set_style_bg_opa(net_list, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(net_list, 4, 0);
+    lv_obj_set_style_pad_all(net_list, 3, 0);
+    lv_obj_set_flex_flow(net_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(net_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(net_list, 3, 0);
+    lv_obj_set_scrollbar_mode(net_list, LV_SCROLLBAR_MODE_AUTO);
+    settingsUi.network_list = net_list;
+
+    // Placeholder text
+    lv_obj_t *placeholder = lv_label_create(net_list);
+    lv_label_set_text(placeholder, "Tap scan to find\nWiFi networks");
+    lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(placeholder, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_align(placeholder, LV_TEXT_ALIGN_CENTER, 0);
+
+    // ========== VERSION INFO ==========
+    lv_obj_t *version_label = lv_label_create(card);
+    lv_obj_add_style(version_label, &style_label_secondary, 0);
+    lv_label_set_text(version_label, "v1.0.0 | WiFi Manager enabled");
+    lv_obj_set_style_text_font(version_label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(version_label, lv_color_hex(0x505050), 0);
+    lv_obj_align(version_label, LV_ALIGN_BOTTOM_MID, 0, -5);
+
+    // Initialize settings state
+    settingsUi.scan_pending = false;
+    settingsUi.password_popup = NULL;
+    memset(settingsUi.selected_ssid, 0, sizeof(settingsUi.selected_ssid));
 }
 
 // --- Public API ---
@@ -570,6 +1008,17 @@ void ui_init() {
     lv_tabview_set_tab_bar_size(tabview, 35);
     lv_obj_set_size(tabview, 320, 240);
     lv_obj_align(tabview, LV_ALIGN_TOP_MID, 0, 0);
+    
+    // Disable swiping between tabs (use tab buttons only)
+    // Get the content area of the tabview and disable scrolling/gestures
+    lv_obj_t *content = lv_tabview_get_content(tabview);
+    if (content) {
+        lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+        lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLL_ONE);
+        lv_obj_remove_flag(content, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_set_scroll_dir(content, LV_DIR_NONE);
+    }
 
     lv_obj_t *tab_music   = lv_tabview_add_tab(tabview, "Music");
     lv_obj_t *tab_tasks   = lv_tabview_add_tab(tabview, "Tasks");
@@ -596,6 +1045,20 @@ void ui_update(const SystemData &sys, const MediaData &med) {
     // Always check artwork_is_new() since artwork may arrive as a standalone message
     if (artwork_is_new()) {
         update_artwork();
+    }
+
+    // --- Update network status in settings (every 2 seconds) ---
+    static uint32_t lastNetUpdate = 0;
+    if (now - lastNetUpdate > 2000) {
+        lastNetUpdate = now;
+        update_wifi_status_display();
+    }
+    
+    // --- Check for scan completion ---
+    if (settingsUi.scan_pending && wifiMgr.isScanComplete()) {
+        settingsUi.scan_pending = false;
+        lv_label_set_text(lv_obj_get_child(settingsUi.scan_btn, 0), LV_SYMBOL_REFRESH " Scan Networks");
+        update_network_list();
     }
 
     // --- Tasks ---
@@ -695,19 +1158,33 @@ void ui_update(const SystemData &sys, const MediaData &med) {
             lv_label_set_text(musicUi.album_label, med.album.c_str());
 
         int dur = med.duration > 0 ? med.duration : 1;
-        int pos = med.position;
-        if (pos < 0) pos = 0;
-        if (pos > dur) pos = dur;
+        int server_pos = med.position;
+        if (server_pos < 0) server_pos = 0;
+        if (server_pos > dur) server_pos = dur;
+        
+        // Update server position tracking for interpolation
+        uint32_t now_ms = lv_tick_get();
+        if (server_pos != musicUi.last_server_position || dur != musicUi.last_server_duration) {
+            // Server sent new position - sync immediately
+            musicUi.last_server_position = server_pos;
+            musicUi.last_server_duration = dur;
+            musicUi.last_update_ms = now_ms;
+            musicUi.interpolated_position = server_pos;
+        }
+        
+        // Use interpolated position for display (updated in ui_tick)
+        int display_pos = musicUi.interpolated_position;
+        if (display_pos > dur) display_pos = dur;
 
         if (musicUi.progress_bar) {
             lv_bar_set_range(musicUi.progress_bar, 0, dur);
-            lv_bar_set_value(musicUi.progress_bar, pos, LV_ANIM_OFF);
+            lv_bar_set_value(musicUi.progress_bar, display_pos, LV_ANIM_OFF);
         }
 
         if (musicUi.progress_label) {
             char pos_str[16];
             char dur_str[16];
-            format_time(pos_str, sizeof(pos_str), pos);
+            format_time(pos_str, sizeof(pos_str), display_pos);
             format_time(dur_str, sizeof(dur_str), dur);
             snprintf(buf, sizeof(buf), "%s / %s", pos_str, dur_str);
             lv_label_set_text(musicUi.progress_label, buf);
@@ -754,43 +1231,85 @@ void ui_update(const SystemData &sys, const MediaData &med) {
                 for (uint8_t i = 0; i < med.queueLen && i < MAX_QUEUE_ITEMS; ++i) {
                     if (strlen(med.queue[i].name) == 0) continue;
                     
-                    // Create a compact clickable button for each queue item
-                    lv_obj_t *item_btn = lv_btn_create(musicUi.queue_list);
-                    lv_obj_set_size(item_btn, LV_PCT(100), 32);
+                    // Create queue item - simpler layout to avoid overlap
+                    // Layout: [Art 32px] [Text ~160px] [Play 32px] [Drag 28px]
+                    // Total width: ~280px (list is 294px)
+                    lv_obj_t *item_btn = lv_obj_create(musicUi.queue_list);
+                    lv_obj_remove_style_all(item_btn);
+                    lv_obj_set_size(item_btn, LV_PCT(100), 40);
                     lv_obj_set_style_bg_color(item_btn, lv_color_hex(0x202040), 0);
                     lv_obj_set_style_bg_opa(item_btn, LV_OPA_COVER, 0);
-                    lv_obj_set_style_radius(item_btn, 4, 0);
-                    lv_obj_set_style_pad_all(item_btn, 4, 0);
+                    lv_obj_set_style_radius(item_btn, 6, 0);
+                    lv_obj_set_style_pad_all(item_btn, 2, 0);
+                    lv_obj_remove_flag(item_btn, LV_OBJ_FLAG_SCROLLABLE);
+                    lv_obj_add_flag(item_btn, LV_OBJ_FLAG_CLICKABLE);
+                    // Store index on item for drag callback
+                    lv_obj_set_user_data(item_btn, (void*)(intptr_t)i);
                     
-                    // Index number
-                    lv_obj_t *idx_label = lv_label_create(item_btn);
-                    snprintf(buf, sizeof(buf), "%d.", i + 1);
-                    lv_label_set_text(idx_label, buf);
-                    lv_obj_set_style_text_font(idx_label, &lv_font_montserrat_12, 0);
-                    lv_obj_set_style_text_color(idx_label, lv_color_hex(0x808080), 0);
-                    lv_obj_align(idx_label, LV_ALIGN_LEFT_MID, 2, 0);
+                    // === Artwork placeholder (left side) ===
+                    lv_obj_t *art_placeholder = lv_obj_create(item_btn);
+                    lv_obj_remove_style_all(art_placeholder);
+                    lv_obj_set_size(art_placeholder, 32, 32);
+                    lv_obj_align(art_placeholder, LV_ALIGN_LEFT_MID, 2, 0);
+                    lv_obj_set_style_bg_color(art_placeholder, lv_color_hex(0x303050), 0);
+                    lv_obj_set_style_bg_opa(art_placeholder, LV_OPA_COVER, 0);
+                    lv_obj_set_style_radius(art_placeholder, 4, 0);
+                    lv_obj_remove_flag(art_placeholder, LV_OBJ_FLAG_SCROLLABLE);
+                    lv_obj_remove_flag(art_placeholder, LV_OBJ_FLAG_CLICKABLE);
                     
-                    // Track name (truncated)
+                    // Music icon in placeholder
+                    lv_obj_t *art_icon = lv_label_create(art_placeholder);
+                    lv_label_set_text(art_icon, LV_SYMBOL_AUDIO);
+                    lv_obj_set_style_text_font(art_icon, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(art_icon, lv_color_hex(0x606080), 0);
+                    lv_obj_center(art_icon);
+                    
+                    // === Track info ===
+                    // Track name - single line, scrolls if too long
                     lv_obj_t *name_label = lv_label_create(item_btn);
                     lv_obj_add_style(name_label, &style_label_primary, 0);
                     lv_label_set_text(name_label, med.queue[i].name);
-                    lv_obj_set_style_text_font(name_label, &lv_font_montserrat_12, 0);
-                    lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
-                    lv_obj_set_width(name_label, 200);
-                    lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 24, 0);
+                    lv_obj_set_style_text_font(name_label, &lv_font_montserrat_10, 0);
+                    lv_label_set_long_mode(name_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                    lv_obj_set_width(name_label, 180);  // Wider now without up/down buttons
+                    lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 38, -8);
                     
-                    // Artist name (smaller, secondary color)
+                    // Artist name (single line, scrolls if too long)
                     lv_obj_t *artist_label = lv_label_create(item_btn);
                     lv_obj_add_style(artist_label, &style_label_secondary, 0);
                     lv_label_set_text(artist_label, med.queue[i].artist);
-                    lv_obj_set_style_text_font(artist_label, &lv_font_montserrat_12, 0);
-                    lv_label_set_long_mode(artist_label, LV_LABEL_LONG_DOT);
-                    lv_obj_set_width(artist_label, 60);
-                    lv_obj_align(artist_label, LV_ALIGN_RIGHT_MID, -2, 0);
+                    lv_obj_set_style_text_font(artist_label, &lv_font_montserrat_10, 0);
+                    lv_label_set_long_mode(artist_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                    lv_obj_set_width(artist_label, 180);  // Wider now without up/down buttons
+                    lv_obj_align(artist_label, LV_ALIGN_LEFT_MID, 38, 8);
                     
-                    // Store index for callback
-                    lv_obj_set_user_data(item_btn, (void*)(intptr_t)i);
-                    lv_obj_add_event_cb(item_btn, queue_item_click_cb, LV_EVENT_CLICKED, NULL);
+                    // === Play button (Spotify only - plays this track immediately) ===
+                    lv_obj_t *play_btn = lv_button_create(item_btn);
+                    lv_obj_set_size(play_btn, 32, 32);
+                    lv_obj_align(play_btn, LV_ALIGN_RIGHT_MID, -36, 0);
+                    lv_obj_set_style_bg_color(play_btn, lv_color_hex(0x1db954), 0);
+                    lv_obj_set_style_radius(play_btn, 16, 0);
+                    lv_obj_set_style_pad_all(play_btn, 0, 0);
+                    lv_obj_t *play_icon = lv_label_create(play_btn);
+                    lv_label_set_text(play_icon, LV_SYMBOL_PLAY);
+                    lv_obj_set_style_text_font(play_icon, &lv_font_montserrat_12, 0);
+                    lv_obj_center(play_icon);
+                    lv_obj_set_user_data(play_btn, (void*)(intptr_t)i);
+                    lv_obj_add_event_cb(play_btn, queue_item_click_cb, LV_EVENT_CLICKED, NULL);
+                    
+                    // === Remove button (X) ===
+                    lv_obj_t *remove_btn = lv_button_create(item_btn);
+                    lv_obj_set_size(remove_btn, 32, 32);
+                    lv_obj_align(remove_btn, LV_ALIGN_RIGHT_MID, -2, 0);
+                    lv_obj_set_style_bg_color(remove_btn, lv_color_hex(0x802020), 0);
+                    lv_obj_set_style_radius(remove_btn, 4, 0);
+                    lv_obj_set_style_pad_all(remove_btn, 0, 0);
+                    lv_obj_t *remove_icon = lv_label_create(remove_btn);
+                    lv_label_set_text(remove_icon, LV_SYMBOL_CLOSE);
+                    lv_obj_set_style_text_font(remove_icon, &lv_font_montserrat_12, 0);
+                    lv_obj_center(remove_icon);
+                    lv_obj_set_user_data(remove_btn, (void*)(intptr_t)i);
+                    // TODO: Add remove callback if needed
                     
                     strncpy(gLastQueueItems[i], med.queue[i].name, MAX_STR_ESP - 1);
                     gLastQueueItems[i][MAX_STR_ESP - 1] = '\0';
@@ -799,4 +1318,59 @@ void ui_update(const SystemData &sys, const MediaData &med) {
             }
         }
     }
+}
+
+// Smoothly interpolate progress bar between server updates
+static uint32_t gLastTickMs = 0;
+
+void ui_tick() {
+    uint32_t now_ms = lv_tick_get();
+    
+    // Only update every 100ms for smooth 10fps interpolation
+    if (now_ms - gLastTickMs < 100) return;
+    uint32_t elapsed_ms = now_ms - gLastTickMs;
+    gLastTickMs = now_ms;
+    
+    // Only interpolate if playing
+    if (musicUi.is_playing && musicUi.last_server_duration > 0) {
+        // Add elapsed time to interpolated position (convert ms to seconds)
+        int elapsed_sec = elapsed_ms / 1000;
+        if (elapsed_ms % 1000 >= 500) elapsed_sec++;  // Round
+        
+        // Use fractional accumulator for sub-second precision
+        static uint32_t ms_accumulator = 0;
+        ms_accumulator += elapsed_ms;
+        if (ms_accumulator >= 1000) {
+            musicUi.interpolated_position += ms_accumulator / 1000;
+            ms_accumulator %= 1000;
+        }
+        
+        // Clamp to duration
+        if (musicUi.interpolated_position > musicUi.last_server_duration) {
+            musicUi.interpolated_position = musicUi.last_server_duration;
+        }
+        
+        // Update progress bar display
+        if (musicUi.progress_bar) {
+            lv_bar_set_value(musicUi.progress_bar, musicUi.interpolated_position, LV_ANIM_OFF);
+        }
+        
+        // Update time label
+        if (musicUi.progress_label) {
+            char pos_str[16], dur_str[16], buf[48];
+            format_time(pos_str, sizeof(pos_str), musicUi.interpolated_position);
+            format_time(dur_str, sizeof(dur_str), musicUi.last_server_duration);
+            snprintf(buf, sizeof(buf), "%s / %s", pos_str, dur_str);
+            lv_label_set_text(musicUi.progress_label, buf);
+        }
+    }
+}
+// External API: set the play state and update UI accordingly
+void ui_set_play_state(bool is_playing) {
+    musicUi.is_playing = is_playing;
+    if (musicUi.play_pause_label) {
+        lv_label_set_text(musicUi.play_pause_label, musicUi.is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    }
+    Serial.print("[UI] ACK play_state=");
+    Serial.println(musicUi.is_playing ? "1" : "0");
 }

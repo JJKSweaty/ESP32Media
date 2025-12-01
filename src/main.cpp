@@ -8,9 +8,17 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <lvgl.h>
+#include <WiFi.h>
 
 #include "data_model.h"
 #include "ui.h"
+
+// Transport mode: "serial", "wifi", or "both"
+// Set to 1 to use WiFi TCP connection instead of serial
+#define USE_WIFI_TRANSPORT 1
+
+// Set to 1 to also keep serial for debugging (only when USE_WIFI_TRANSPORT is 1)
+#define KEEP_SERIAL_DEBUG 1
 
 // Increase Arduino loop task stack size (default is 8KB, we need more for LVGL 9)
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
@@ -95,8 +103,21 @@ void setup() {
     data_model_init();
     ui_init();
 
-    // Start serial reader task
+#if USE_WIFI_TRANSPORT
+    // Start WiFi task for TCP data (WiFi credentials managed by WiFiManager)
+    Serial.println("Starting WiFi transport...");
+    start_wifi_task(TCP_SERVER_IP, TCP_SERVER_PORT);
+    
+    #if !KEEP_SERIAL_DEBUG
+    // Optionally disable serial task if not needed
+    #else
+    // Keep serial for debugging but not for data
+    Serial.println("Serial kept for debug output.");
+    #endif
+#else
+    // Use serial for data transport
     start_serial_task();
+#endif
 
     Serial.println("Setup complete.");
 }
@@ -104,6 +125,9 @@ void setup() {
 void loop() {
     lv_tick_inc(5);
     lv_timer_handler();
+    
+    // Smooth progress bar interpolation (call frequently)
+    ui_tick();
 
     SnapshotMsg msg;
     if (data_model_try_dequeue(msg)) {

@@ -37,6 +37,7 @@
 /* Fonts — enable commonly used Montserrat sizes used by the UI. */
 /* LVGL will only compile the selected fonts; enabling ensures symbols like
  * `lv_font_montserrat_12/14/16` are available to `ui.cpp`. */
+#define LV_FONT_MONTSERRAT_10 1
 #define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1

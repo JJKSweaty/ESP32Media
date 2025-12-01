@@ -1,9 +1,17 @@
 #include "data_model.h"
 #include <ArduinoJson.h>
 #include "mbedtls/base64.h"
+#include "ui.h"
+#include <WiFi.h>
+#include <WiFiClient.h>
 
 QueueHandle_t gSnapshotQueue = nullptr;
 static String gSerialLineBuf;
+
+// Command queue for sending to Python server (non-blocking)
+static QueueHandle_t gCommandQueue = nullptr;
+#define CMD_QUEUE_SIZE 8
+#define CMD_MAX_LEN 128
 
 // Global artwork buffer (decoded RGB565) - NOT in the queue
 static uint8_t gArtworkRgb565[ARTWORK_RGB565_SIZE];
@@ -60,13 +68,11 @@ static bool decodeArtworkB64(const char* b64, size_t b64Len) {
     );
     
     if (ret != 0 || outLen != ARTWORK_RGB565_SIZE) {
-        Serial.printf("[ART] Decode failed: ret=%d, size=%u (expected %u)\n", ret, outLen, ARTWORK_RGB565_SIZE);
         return false;
     }
     
     gLastArtworkHash = h;
     gArtworkNew = true;
-    Serial.println("[ART] Decoded successfully");
     return true;
 }
 
@@ -74,37 +80,43 @@ static bool decodeArtworkB64(const char* b64, size_t b64Len) {
 static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
     // Check if this is a standalone artwork message
     if (input.indexOf("artwork_b64") > 0 && input.indexOf("cpu_percent") < 0) {
-        Serial.println("[ESP] Received artwork message!");
         // This is just artwork - parse and decode it, don't update msg
         DynamicJsonDocument doc(32768);
         DeserializationError err = deserializeJson(doc, input);
         if (err) {
-            Serial.print("Artwork JSON parse error: ");
-            Serial.println(err.f_str());
             return false;
         }
         if (doc.containsKey("artwork_b64")) {
             const char* b64 = doc["artwork_b64"] | "";
             size_t b64len = strlen(b64);
-            Serial.printf("[ESP] artwork_b64 length: %u\n", b64len);
             if (b64len > 100) {
-                if (decodeArtworkB64(b64, b64len)) {
-                    Serial.println("[ESP] Artwork decoded successfully!");
-                }
+                decodeArtworkB64(b64, b64len);
             }
         }
         return false;  // Don't queue this as a snapshot
     }
+
+    // If the message is a one-off 'ack' command (acknowledgement), apply quick UI updates
+    // Parse minimal JSON for ack
+    if (input.indexOf("\"ack\"") > 0) {
+        DynamicJsonDocument ackDoc(256);
+        DeserializationError ackErr = deserializeJson(ackDoc, input);
+        if (!ackErr && ackDoc.containsKey("ack")) {
+            const char* ackVal = ackDoc["ack"] | "";
+            if (strcmp(ackVal, "play") == 0) {
+                ui_set_play_state(true);
+            } else if (strcmp(ackVal, "pause") == 0) {
+                ui_set_play_state(false);
+            }
+        }
+        return false; // Not a full snapshot
+    }
     
     // Regular system snapshot - need larger buffer for queue data
-    // JSON size is ~2800 bytes, ArduinoJson needs ~1.5x for parsing overhead
     DynamicJsonDocument doc(6144);
     
     DeserializationError err = deserializeJson(doc, input);
     if (err) {
-        Serial.print("JSON parse error: ");
-        Serial.println(err.f_str());
-        Serial.printf("  Input size: %d, Free heap: %d\n", input.length(), ESP.getFreeHeap());
         return false;
     }
 
@@ -272,7 +284,6 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
 // RTOS task: producer – reads Serial, parses JSON, sends SnapshotMsg to queue
 static void serial_task(void *pvParameters) {
     (void) pvParameters;
-    Serial.println("[SerialTask] Started.");
 
     for (;;) {
         while (Serial.available() > 0) {
@@ -293,7 +304,6 @@ static void serial_task(void *pvParameters) {
                 }
             } else if (c != '\r') {
                 gSerialLineBuf += c;
-                // Allow larger buffer for artwork JSON
                 if (gSerialLineBuf.length() > 65535) {
                     gSerialLineBuf = "";
                 }
@@ -305,10 +315,34 @@ static void serial_task(void *pvParameters) {
 }
 
 void data_model_init() {
-    // xQueueOverwrite requires queue size of 1
     gSnapshotQueue = xQueueCreate(1, sizeof(SnapshotMsg));
-    if (!gSnapshotQueue) {
-        Serial.println("[data_model] Failed to create snapshot queue!");
+    gCommandQueue = xQueueCreate(CMD_QUEUE_SIZE, CMD_MAX_LEN);
+    if (!gCommandQueue) {
+        Serial.println("[data_model] Failed to create command queue!");
+    }
+}
+
+// Non-blocking command send - sends via Serial immediately (most reliable)
+void send_command(const char* cmd) {
+    if (!cmd) return;
+    // Ensure newline termination
+    size_t len = strlen(cmd);
+    bool has_newline = (len > 0 && cmd[len - 1] == '\n');
+    
+    // Send directly via Serial - this is immediate and reliable
+    if (has_newline) {
+        Serial.write((const uint8_t*)cmd, len);
+    } else {
+        Serial.write((const uint8_t*)cmd, len);
+        Serial.write((const uint8_t*)"\n", 1);
+    }
+    
+    // Also queue for WiFi if available (optional)
+    if (gCommandQueue) {
+        char buf[CMD_MAX_LEN];
+        strncpy(buf, cmd, CMD_MAX_LEN - 1);
+        buf[CMD_MAX_LEN - 1] = '\0';
+        xQueueSend(gCommandQueue, buf, 0);  // Non-blocking, drop if full
     }
 }
 
@@ -317,6 +351,108 @@ void start_serial_task() {
         serial_task,
         "SerialTask",
         16384,      // 16KB stack - enough for JSON parsing with queue data
+        nullptr,
+        1,          // priority
+        nullptr,
+        0           // core 0
+    );
+}
+
+// ========== WiFi Task ==========
+#include <WiFi.h>
+#include "wifi_manager.h"
+
+// TCP server connection parameters (set via start_wifi_task)
+static const char* gTcpHost = nullptr;
+static uint16_t gTcpPort = 5555;
+
+static void wifi_task(void *pvParameters) {
+    (void) pvParameters;
+    
+    // Buffer for incoming TCP data
+    String lineBuf;
+    lineBuf.reserve(8192);
+    
+    for (;;) {
+        // Check WiFi connection
+        if (WiFi.status() != WL_CONNECTED) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        
+        // Try to connect to TCP server
+        WiFiClient client;
+        
+        if (!client.connect(gTcpHost, gTcpPort)) {
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+        
+        client.setTimeout(1);
+        client.setNoDelay(true);
+        lineBuf = "";
+        
+        while (client.connected() && WiFi.status() == WL_CONNECTED) {
+            // === SEND QUEUED COMMANDS (non-blocking) ===
+            char cmdBuf[CMD_MAX_LEN];
+            while (gCommandQueue && xQueueReceive(gCommandQueue, cmdBuf, 0) == pdTRUE) {
+                size_t len = strlen(cmdBuf);
+                if (len > 0) {
+                    client.print(cmdBuf);
+                    if (cmdBuf[len-1] != '\n') {
+                        client.print('\n');
+                    }
+                }
+            }
+            
+            // === READ INCOMING DATA ===
+            while (client.available() > 0) {
+                char c = (char)client.read();
+                
+                if (c == '\n') {
+                    String line = lineBuf;
+                    lineBuf = "";
+                    line.trim();
+                    
+                    if (line.length() > 5) {
+                        SnapshotMsg msg;
+                        if (parse_json_into_msg(line, msg)) {
+                            if (gSnapshotQueue) {
+                                xQueueOverwrite(gSnapshotQueue, &msg);
+                            }
+                        }
+                    }
+                } else if (c != '\r') {
+                    lineBuf += c;
+                    if (lineBuf.length() > 65535) {
+                        lineBuf = "";
+                    }
+                }
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        
+        client.stop();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+void start_wifi_task(const char* host, uint16_t port) {
+    gTcpHost = host;
+    gTcpPort = port;
+    
+    // Initialize WiFi manager (handles credentials from NVS)
+    wifiMgr.begin();
+    
+    // Try to auto-connect to saved networks
+    wifiMgr.autoConnect();
+    
+    // Start the WiFi task
+    xTaskCreatePinnedToCore(
+        wifi_task,
+        "WiFiTask",
+        12288,      // 12KB stack
         nullptr,
         1,          // priority
         nullptr,

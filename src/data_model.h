@@ -3,6 +3,14 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
+// ============= TCP Server Configuration =============
+// The TCP server IP/port should match your Python server
+#define TCP_SERVER_IP "192.168.1.168"   
+#define TCP_SERVER_PORT 5555
+
+// WiFi credentials are now managed by WiFiManager (stored in NVS)
+// See wifi_manager.h for runtime network selection
+
 // Artwork dimensions
 #define ARTWORK_WIDTH 80
 #define ARTWORK_HEIGHT 80
@@ -103,7 +111,11 @@ extern QueueHandle_t gSnapshotQueue;
 
 void data_model_init();
 void start_serial_task();
+void start_wifi_task(const char* host, uint16_t port);  // WiFi managed by WiFiManager
 bool data_model_try_dequeue(SnapshotMsg &msg);
+
+// Send a command to the Python server (non-blocking, uses WiFi if available)
+void send_command(const char* cmd);
 
 // Artwork buffer access (global static buffer, not in queue)
 uint8_t* artwork_get_rgb565_buffer();
