@@ -119,6 +119,7 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
     msg.procCount = 0;
     for (int i = 0; i < 5; ++i) {
         msg.procs[i][0] = '\0';
+        msg.procPids[i] = 0;
     }
 
     // Parse proc_top5 (rich objects) or fallback to cpu_top5_process (legacy string list)
@@ -132,9 +133,13 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
                 int pid = o["pid"] | 0;
                 float mem = o["mem"] | 0.0f;
                 const char *name = o["name"] | "";
+                const char *display = o["display_name"] | name;
                 char buf[32];
-                snprintf(buf, sizeof(buf), "%d: %.1f%% %s", pid, mem, name);
+                // Display string should hide PID and remove ".exe" suffix
+                // The Python backend provides `display_name`, but fallback to `name`.
+                snprintf(buf, sizeof(buf), "%.1f%% %s", mem, display);
                 safeStrCopy(msg.procs[idx], sizeof(msg.procs[idx]), String(buf));
+                msg.procPids[idx] = pid;
                 idx++;
             }
         }
@@ -144,7 +149,7 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
         if (procs.is<JsonArray>()) {
             JsonArray arr = procs.as<JsonArray>();
             uint8_t idx = 0;
-            for (JsonVariant v : arr) {
+                for (JsonVariant v : arr) {
                 if (idx >= 5) break;
                 String line;
                 if (v.is<const char*>()) {
@@ -152,7 +157,18 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
                 } else {
                     serializeJson(v, line);
                 }
-                safeStrCopy(msg.procs[idx], sizeof(msg.procs[idx]), line);
+                // Try to strip PID/EXE in fallback string
+                // If line contains a percent and text, we assume it's in format "<mem>% <name>"
+                // Keep as-is but remove .exe if present
+                String clean = line;
+                // Remove .exe suffixs in fallback
+                int posExe = clean.indexOf(".exe");
+                if (posExe >= 0) {
+                    // remove .exe
+                    clean.remove(posExe, 4);
+                }
+                safeStrCopy(msg.procs[idx], sizeof(msg.procs[idx]), clean);
+                msg.procPids[idx] = 0; // unknown PID in fallback
                 idx++;
             }
             msg.procCount = idx;

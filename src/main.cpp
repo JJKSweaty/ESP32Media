@@ -118,6 +118,7 @@ void loop() {
         
         for (uint8_t i = 0; i < msg.procCount && i < 5; ++i) {
             sys.procs[i] = String(msg.procs[i]);
+                sys.procPids[i] = msg.procPids[i];
         }
 
         if (msg.hasMedia) {

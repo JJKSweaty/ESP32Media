@@ -13,6 +13,7 @@ struct SystemData {
     float mem = 0.0f;
     float gpu = 0.0f;    // GPU usage percentage
     String procs[5];
+    int procPids[5];
     uint8_t procCount = 0;
     bool valid = false;
 };
@@ -38,6 +39,7 @@ typedef struct {
     float gpu;           // GPU usage percentage
     uint8_t procCount;
     char procs[5][32];
+    int procPids[5];
 
     bool hasMedia;
     char title[64];

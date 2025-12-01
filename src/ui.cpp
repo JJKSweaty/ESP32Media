@@ -55,11 +55,14 @@ static void kill_proc_event_cb(lv_event_t *e) {
     
     if (label && lv_obj_check_type(label, &lv_label_class)) {
         const char *txt = lv_label_get_text(label);
+        // Try to read PID from label's user data (preferred)
+        int pid = 0;
+        void *ud = lv_obj_get_user_data(label);
+        if (ud) pid = (int)(intptr_t)ud;
         Serial.print("[UI] Kill requested for: ");
         Serial.println(txt);
         // Parse a PID at the start like "1234: ..."
-        int pid = 0;
-        if (txt) {
+        if (pid == 0 && txt) {
             // find colon
             const char *colon = strchr(txt, ':');
             if (colon) {
@@ -310,8 +313,10 @@ static void build_task_tab(lv_obj_t *parent) {
     lv_obj_t *left_panel = lv_obj_create(parent);
     lv_obj_remove_style_all(left_panel);
     lv_obj_add_style(left_panel, &style_card, 0);
-    lv_obj_set_size(left_panel, 125, 185);
-    lv_obj_align(left_panel, LV_ALIGN_TOP_LEFT, 2, 2);
+    lv_obj_set_size(left_panel, 125, 180);
+    // Nudge the left panel down slightly so its inner content aligns vertically
+    // with the right panel's title and content
+    lv_obj_align(left_panel, LV_ALIGN_TOP_LEFT, 2, 8);
 
     // CPU Arc (outermost, cyan)
     lv_obj_t *cpu_arc = lv_arc_create(left_panel);
@@ -381,8 +386,9 @@ static void build_task_tab(lv_obj_t *parent) {
     lv_obj_t *right_panel = lv_obj_create(parent);
     lv_obj_remove_style_all(right_panel);
     lv_obj_add_style(right_panel, &style_card, 0);
-    lv_obj_set_size(right_panel, 180, 185);
-    lv_obj_align(right_panel, LV_ALIGN_TOP_RIGHT, -2, 0);
+    lv_obj_set_size(right_panel, 180, 180);
+    // Match the vertical offset to the left panel for consistent alignment
+    lv_obj_align(right_panel, LV_ALIGN_TOP_RIGHT, -2, 8);
 
     lv_obj_t *list_title = lv_label_create(right_panel);
     lv_obj_add_style(list_title, &style_label_secondary, 0);
@@ -390,11 +396,14 @@ static void build_task_tab(lv_obj_t *parent) {
     lv_obj_align(list_title, LV_ALIGN_TOP_MID, 0, 2);
 
     lv_obj_t *list = lv_list_create(right_panel);
-    lv_obj_set_size(list, 165, 155);
-    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    // Move the list down slightly to avoid overlap with the title and ensure the top
+    // row is visible (was getting cut off on some displays / fonts).
+    lv_obj_set_size(list, 165, 150);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 20);
     lv_obj_set_style_bg_color(list, lv_color_hex(0x151525), 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    lv_obj_set_style_pad_all(list, 2, 0);
+    lv_obj_set_style_pad_all(list, 4, 0);
+    lv_obj_set_style_pad_top(list, 6, 0);
 
     taskUi.cpu_arc = cpu_arc;
     taskUi.mem_arc = mem_arc;
@@ -530,12 +539,13 @@ void ui_update(const SystemData &sys, const MediaData &med) {
                 // Create a custom row with kill button + text
                 lv_obj_t *row = lv_obj_create(taskUi.proc_list);
                 lv_obj_remove_style_all(row);
-                lv_obj_set_size(row, LV_PCT(100), 28);
+                // Make rows slightly taller to avoid label clipping on top/bottom
+                lv_obj_set_size(row, LV_PCT(100), 34);
                 lv_obj_set_layout(row, LV_LAYOUT_FLEX);
                 lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
                 lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
                 lv_obj_set_style_pad_column(row, 4, 0);
-                lv_obj_set_style_pad_all(row, 2, 0);
+                lv_obj_set_style_pad_all(row, 4, 0);
                 
                 // Kill button - bigger, red, with X
                 lv_obj_t *kill_btn = lv_button_create(row);
@@ -550,10 +560,15 @@ void ui_update(const SystemData &sys, const MediaData &med) {
                 lv_obj_add_style(proc_label, &style_label_primary, 0);
                 lv_label_set_text(proc_label, sys.procs[i].c_str());
                 lv_obj_set_style_text_font(proc_label, &lv_font_montserrat_12, 0);
-                lv_label_set_long_mode(proc_label, LV_LABEL_LONG_CLIP);
+                // Clip long names horizontally, but prefer scrolling to avoid truncated display
+                lv_label_set_long_mode(proc_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_style_text_align(proc_label, LV_TEXT_ALIGN_LEFT, 0);
+                lv_obj_set_style_pad_left(proc_label, 4, 0);
                 lv_obj_set_flex_grow(proc_label, 1);
                 
-                // Store proc text in button's user data and attach callback
+                // Store both label pointer as user data for previous logic AND store PID on the label user data
+                // Attach callback
+                lv_obj_set_user_data(proc_label, (void*)(intptr_t)sys.procPids[i]);
                 lv_obj_add_event_cb(kill_btn, kill_proc_event_cb, LV_EVENT_CLICKED, proc_label);
                 
                 gLastProcs[i] = sys.procs[i];
