@@ -3,10 +3,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
-// RGB565 artwork buffer (80x80 = 12800 bytes)
+// Artwork dimensions
 #define ARTWORK_WIDTH 80
 #define ARTWORK_HEIGHT 80
-#define ARTWORK_BUF_SIZE (ARTWORK_WIDTH * ARTWORK_HEIGHT * 2)
+#define ARTWORK_RGB565_SIZE (ARTWORK_WIDTH * ARTWORK_HEIGHT * 2)  // 12800 bytes
 
 struct SystemData {
     float cpu = 0.0f;
@@ -23,12 +23,15 @@ struct MediaData {
     String album;
     int position = 0;    // seconds
     int duration = 0;    // seconds
+    bool isPlaying = false;
 
-    bool hasArtwork = false; // true if artwork is available
+    bool hasArtwork = false;
+    bool artworkUpdated = false;  // Set true when new artwork is ready
 
     bool valid = false;
 };
 
+// Keep SnapshotMsg small - no artwork in the queue!
 typedef struct {
     float cpu;
     float mem;
@@ -42,7 +45,10 @@ typedef struct {
     char album[64];
     int position;
     int duration;
-    bool hasArtwork;
+    bool isPlaying;
+    
+    bool hasArtwork;       // Indicates artwork was parsed
+    bool artworkUpdated;   // Indicates new artwork in global buffer
 } SnapshotMsg;
 
 extern QueueHandle_t gSnapshotQueue;
@@ -51,11 +57,7 @@ void data_model_init();
 void start_serial_task();
 bool data_model_try_dequeue(SnapshotMsg &msg);
 
-// Artwork handling functions
-void artwork_start();
-void artwork_chunk(const char* hexData, size_t len);
-void artwork_end();
-uint8_t* artwork_get_buffer();
-bool artwork_is_ready();
-size_t artwork_get_size();
-void artwork_clear_ready();
+// Artwork buffer access (global static buffer, not in queue)
+uint8_t* artwork_get_rgb565_buffer();
+bool artwork_is_new();
+void artwork_clear_new();

@@ -14,9 +14,10 @@ static lv_style_t style_screen_bg;
 static lv_style_t style_card;
 static lv_style_t style_label_primary;
 static lv_style_t style_label_secondary;
+static lv_style_t style_kill_btn;  // Style for kill buttons
 
-// Canvas buffer for artwork (must be static to persist)
-static lv_color_t canvas_buf[80 * 80];
+// Artwork display - use lv_image with raw RGB565 data
+static lv_image_dsc_t artwork_dsc;
 static bool gArtworkDisplayed = false;
 
 // --- Task UI holder (using arcs instead of meter in LVGL 9) ---
@@ -34,34 +35,25 @@ static TaskUI taskUi;
 // --- Music UI holder ---
 struct MusicUI {
     lv_obj_t *art_container;  // Container for artwork
-    lv_obj_t *art_canvas;     // Canvas for actual image
+    lv_obj_t *art_img;        // Image widget for artwork
     lv_obj_t *art_icon;       // Fallback icon label
     lv_obj_t *title_label;
     lv_obj_t *artist_label;
     lv_obj_t *album_label;
     lv_obj_t *progress_bar;
     lv_obj_t *progress_label;
+    lv_obj_t *play_pause_btn;  // Single toggle button
+    lv_obj_t *play_pause_label; // Label to update icon
+    bool is_playing;           // Track current state
 };
 static MusicUI musicUi;
 
 // Kill button callback for process list
 static void kill_proc_event_cb(lv_event_t *e) {
-    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
-    // Find child label
-    lv_obj_t *label = nullptr;
-    uint32_t child_cnt = lv_obj_get_child_cnt(btn);
-    for (uint32_t i = 0; i < child_cnt; ++i) {
-        lv_obj_t *c = lv_obj_get_child(btn, i);
-        if (c && lv_obj_check_type(c, &lv_label_class)) {
-            label = c;
-            break;
-        }
-    }
-    if (!label) {
-        // fallback: try child 0
-        label = lv_obj_get_child(btn, 0);
-    }
-    if (label) {
+    // Get the label passed as user_data
+    lv_obj_t *label = (lv_obj_t *)lv_event_get_user_data(e);
+    
+    if (label && lv_obj_check_type(label, &lv_label_class)) {
         const char *txt = lv_label_get_text(label);
         Serial.print("[UI] Kill requested for: ");
         Serial.println(txt);
@@ -88,18 +80,43 @@ static void kill_proc_event_cb(lv_event_t *e) {
         } else {
             Serial.println("[UI] Could not parse PID from label.");
         }
+    } else {
+        Serial.println("[UI] Could not find process label.");
     }
+}
+
+// Display artwork from the global RGB565 buffer (decoded in data_model)
+static void update_artwork() {
+    if (!musicUi.art_img) return;
+    if (!artwork_is_new()) return;
+    
+    // Get the decoded RGB565 data from global buffer
+    uint8_t* rgb565_data = artwork_get_rgb565_buffer();
+    
+    // Setup image descriptor for LVGL
+    artwork_dsc.header.w = ARTWORK_WIDTH;
+    artwork_dsc.header.h = ARTWORK_HEIGHT;
+    artwork_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    artwork_dsc.header.stride = ARTWORK_WIDTH * 2;
+    artwork_dsc.data_size = ARTWORK_RGB565_SIZE;
+    artwork_dsc.data = rgb565_data;
+
+    // Set image source
+    lv_image_set_src(musicUi.art_img, &artwork_dsc);
+
+    // Show image, hide icon
+    lv_obj_remove_flag(musicUi.art_img, LV_OBJ_FLAG_HIDDEN);
+    if (musicUi.art_icon) lv_obj_add_flag(musicUi.art_icon, LV_OBJ_FLAG_HIDDEN);
+
+    gArtworkDisplayed = true;
+    artwork_clear_new();  // Mark as consumed
+    Serial.println("[UI] Artwork displayed");
 }
 
 static void play_event_cb(lv_event_t *e) {
     (void)e;
-    const char *cmd = "{\"cmd\":\"play\"}\n";
-    Serial.print(cmd);
-}
-
-static void pause_event_cb(lv_event_t *e) {
-    (void)e;
-    const char *cmd = "{\"cmd\":\"pause\"}\n";
+    // Toggle play/pause - send the appropriate command based on current state
+    const char *cmd = musicUi.is_playing ? "{\"cmd\":\"pause\"}\n" : "{\"cmd\":\"play\"}\n";
     Serial.print(cmd);
 }
 
@@ -150,6 +167,15 @@ static void init_styles() {
 
     lv_style_init(&style_label_secondary);
     lv_style_set_text_color(&style_label_secondary, lv_color_hex(0x909090));
+    
+    // Kill button style - red background, white X, larger
+    lv_style_init(&style_kill_btn);
+    lv_style_set_bg_color(&style_kill_btn, lv_palette_main(LV_PALETTE_RED));
+    lv_style_set_bg_opa(&style_kill_btn, LV_OPA_COVER);
+    lv_style_set_radius(&style_kill_btn, 4);
+    lv_style_set_text_color(&style_kill_btn, lv_color_hex(0xFFFFFF));
+    lv_style_set_text_font(&style_kill_btn, &lv_font_montserrat_16);
+    lv_style_set_pad_all(&style_kill_btn, 2);
 }
 
 // --- MUSIC TAB ---
@@ -175,11 +201,11 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_set_style_pad_all(art_container, 0, 0);
     lv_obj_remove_flag(art_container, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Canvas for actual artwork image
-    lv_obj_t *art_canvas = lv_canvas_create(art_container);
-    lv_canvas_set_buffer(art_canvas, canvas_buf, 80, 80, LV_COLOR_FORMAT_RGB565);
-    lv_obj_align(art_canvas, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_add_flag(art_canvas, LV_OBJ_FLAG_HIDDEN);  // Hidden until we have artwork
+    // Image widget for artwork (hidden until we have data)
+    lv_obj_t *art_img = lv_image_create(art_container);
+    lv_obj_set_size(art_img, 80, 80);
+    lv_obj_align(art_img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(art_img, LV_OBJ_FLAG_HIDDEN);  // Hidden until we have artwork
     
     // Music icon placeholder (shown when no artwork)
     lv_obj_t *icon = lv_label_create(art_container);
@@ -210,25 +236,25 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_set_width(album, 210);
     lv_obj_align(album, LV_ALIGN_TOP_LEFT, 90, 50);
 
-    // Progress bar
+    // Progress bar - positioned above controls
     lv_obj_t *bar = lv_bar_create(card);
-    lv_obj_set_size(bar, 290, 10);
-    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -25);
+    lv_obj_set_size(bar, 290, 8);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -55);
     lv_bar_set_range(bar, 0, 100);
     lv_bar_set_value(bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x303050), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar, lv_palette_main(LV_PALETTE_CYAN), LV_PART_INDICATOR);
-    lv_obj_set_style_radius(bar, 5, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 5, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
 
-    // Time label
+    // Time label - just below progress bar
     lv_obj_t *time_label = lv_label_create(card);
     lv_obj_add_style(time_label, &style_label_secondary, 0);
     lv_label_set_text(time_label, "0:00 / 0:00");
-    lv_obj_align(time_label, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_align(time_label, LV_ALIGN_BOTTOM_MID, 0, -38);
 
     musicUi.art_container = art_container;
-    musicUi.art_canvas = art_canvas;
+    musicUi.art_img = art_img;
     musicUi.art_icon = icon;
     musicUi.title_label = title;
     musicUi.artist_label = artist;
@@ -236,39 +262,38 @@ static void build_music_tab(lv_obj_t *parent) {
     musicUi.progress_bar = bar;
     musicUi.progress_label = time_label;
 
-    // Controls: back / play / next
+    // Controls: back / play-pause / next - at bottom (3 buttons instead of 4)
     lv_obj_t *controls = lv_obj_create(card);
     lv_obj_remove_style_all(controls);
-    lv_obj_set_size(controls, 260, 32);
-    lv_obj_align(controls, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(controls, 200, 30);
+    lv_obj_align(controls, LV_ALIGN_BOTTOM_MID, 0, -4);
     lv_obj_set_layout(controls, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(controls, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(controls, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(controls, 4, 0);
+    lv_obj_set_style_pad_column(controls, 16, 0);
 
     lv_obj_t *prev_btn = lv_btn_create(controls);
-    lv_obj_set_size(prev_btn, 44, 28);
+    lv_obj_set_size(prev_btn, 50, 28);
     lv_obj_t *prev_label = lv_label_create(prev_btn);
     lv_label_set_text(prev_label, LV_SYMBOL_PREV);
     lv_obj_center(prev_label);
     lv_obj_add_event_cb(prev_btn, prev_event_cb, LV_EVENT_CLICKED, NULL);
 
+    // Single play/pause toggle button
     lv_obj_t *play_btn = lv_btn_create(controls);
-    lv_obj_set_size(play_btn, 44, 28);
+    lv_obj_set_size(play_btn, 50, 28);
     lv_obj_t *play_label = lv_label_create(play_btn);
-    lv_label_set_text(play_label, LV_SYMBOL_PLAY);
+    lv_label_set_text(play_label, LV_SYMBOL_PLAY);  // Default to play icon
     lv_obj_center(play_label);
     lv_obj_add_event_cb(play_btn, play_event_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *pause_btn = lv_btn_create(controls);
-    lv_obj_set_size(pause_btn, 44, 28);
-    lv_obj_t *pause_label = lv_label_create(pause_btn);
-    lv_label_set_text(pause_label, LV_SYMBOL_PAUSE);
-    lv_obj_center(pause_label);
-    lv_obj_add_event_cb(pause_btn, pause_event_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Store references for updating the icon
+    musicUi.play_pause_btn = play_btn;
+    musicUi.play_pause_label = play_label;
+    musicUi.is_playing = false;
 
     lv_obj_t *next_btn = lv_btn_create(controls);
-    lv_obj_set_size(next_btn, 44, 28);
+    lv_obj_set_size(next_btn, 50, 28);
     lv_obj_t *next_label = lv_label_create(next_btn);
     lv_label_set_text(next_label, LV_SYMBOL_NEXT);
     lv_obj_center(next_label);
@@ -362,7 +387,7 @@ static void build_task_tab(lv_obj_t *parent) {
     lv_obj_t *list_title = lv_label_create(right_panel);
     lv_obj_add_style(list_title, &style_label_secondary, 0);
     lv_label_set_text(list_title, "Top Processes");
-    lv_obj_align(list_title, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_align(list_title, LV_ALIGN_TOP_MID, 0, 2);
 
     lv_obj_t *list = lv_list_create(right_panel);
     lv_obj_set_size(list, 165, 155);
@@ -453,27 +478,9 @@ void ui_update(const SystemData &sys, const MediaData &med) {
 
     char buf[64];
 
-    // --- Check for new artwork ---
-    if (artwork_is_ready() && musicUi.art_canvas) {
-        // Copy RGB565 data to canvas buffer
-        uint8_t *src = artwork_get_buffer();
-        size_t srcSize = artwork_get_size();
-        
-        if (srcSize == ARTWORK_BUF_SIZE) {
-            // Direct copy - RGB565 data is already in correct format
-            memcpy(canvas_buf, src, srcSize);
-            
-            // Show canvas, hide icon
-            lv_obj_remove_flag(musicUi.art_canvas, LV_OBJ_FLAG_HIDDEN);
-            if (musicUi.art_icon) lv_obj_add_flag(musicUi.art_icon, LV_OBJ_FLAG_HIDDEN);
-            
-            // Invalidate canvas to trigger redraw
-            lv_obj_invalidate(musicUi.art_canvas);
-            
-            gArtworkDisplayed = true;
-            Serial.println("[UI] Artwork displayed");
-        }
-        artwork_clear_ready();  // Mark as consumed
+    // --- Check for new artwork (decoded in data_model, stored in global buffer) ---
+    if (med.valid && med.artworkUpdated) {
+        update_artwork();
     }
 
     // --- Tasks ---
@@ -518,9 +525,36 @@ void ui_update(const SystemData &sys, const MediaData &med) {
             lv_obj_clean(taskUi.proc_list);
             for (uint8_t i = 0; i < sys.procCount; ++i) {
                 if (!sys.procs[i].length()) continue;
-                // Button with close icon + process text
-                lv_obj_t *btn = lv_list_add_button(taskUi.proc_list, LV_SYMBOL_CLOSE, sys.procs[i].c_str());
-                lv_obj_add_event_cb(btn, kill_proc_event_cb, LV_EVENT_CLICKED, NULL);
+                
+                // Create a custom row with kill button + text
+                lv_obj_t *row = lv_obj_create(taskUi.proc_list);
+                lv_obj_remove_style_all(row);
+                lv_obj_set_size(row, LV_PCT(100), 28);
+                lv_obj_set_layout(row, LV_LAYOUT_FLEX);
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                lv_obj_set_style_pad_column(row, 4, 0);
+                lv_obj_set_style_pad_all(row, 2, 0);
+                
+                // Kill button - bigger, red, with X
+                lv_obj_t *kill_btn = lv_button_create(row);
+                lv_obj_add_style(kill_btn, &style_kill_btn, 0);
+                lv_obj_set_size(kill_btn, 28, 22);
+                lv_obj_t *x_label = lv_label_create(kill_btn);
+                lv_label_set_text(x_label, "X");
+                lv_obj_center(x_label);
+                
+                // Process name label (store the full text for PID extraction)
+                lv_obj_t *proc_label = lv_label_create(row);
+                lv_obj_add_style(proc_label, &style_label_primary, 0);
+                lv_label_set_text(proc_label, sys.procs[i].c_str());
+                lv_obj_set_style_text_font(proc_label, &lv_font_montserrat_12, 0);
+                lv_label_set_long_mode(proc_label, LV_LABEL_LONG_CLIP);
+                lv_obj_set_flex_grow(proc_label, 1);
+                
+                // Store proc text in button's user data and attach callback
+                lv_obj_add_event_cb(kill_btn, kill_proc_event_cb, LV_EVENT_CLICKED, proc_label);
+                
                 gLastProcs[i] = sys.procs[i];
             }
             gLastProcCount = sys.procCount;
@@ -558,11 +592,17 @@ void ui_update(const SystemData &sys, const MediaData &med) {
             lv_label_set_text(musicUi.progress_label, buf);
         }
         
+        // Update play/pause button icon based on current state
+        if (musicUi.play_pause_label && med.isPlaying != musicUi.is_playing) {
+            musicUi.is_playing = med.isPlaying;
+            lv_label_set_text(musicUi.play_pause_label, med.isPlaying ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        }
+        
         // Show/hide artwork placeholder based on whether we have displayed artwork
         if (!gArtworkDisplayed && musicUi.art_icon) {
             // No artwork yet - show icon
             lv_obj_remove_flag(musicUi.art_icon, LV_OBJ_FLAG_HIDDEN);
-            if (musicUi.art_canvas) lv_obj_add_flag(musicUi.art_canvas, LV_OBJ_FLAG_HIDDEN);
+            if (musicUi.art_img) lv_obj_add_flag(musicUi.art_img, LV_OBJ_FLAG_HIDDEN);
         }
     }
 }

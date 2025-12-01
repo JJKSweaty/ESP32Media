@@ -126,12 +126,16 @@ void loop() {
             med.album = String(msg.album);
             med.position = msg.position;
             med.duration = msg.duration;
+            med.isPlaying = msg.isPlaying;
             med.valid = true;
-            med.hasArtwork = false;
-            med.artwork_b64 = "";
+            
+            // Artwork is decoded directly into global buffer by data_model
+            med.hasArtwork = msg.hasArtwork;
+            med.artworkUpdated = msg.artworkUpdated;
         } else {
             med.valid = false;
             med.hasArtwork = false;
+            med.artworkUpdated = false;
         }
 
         ui_update(sys, med);

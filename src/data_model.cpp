@@ -1,61 +1,36 @@
 #include "data_model.h"
 #include <ArduinoJson.h>
+#include "mbedtls/base64.h"
 
 QueueHandle_t gSnapshotQueue = nullptr;
 static String gSerialLineBuf;
 
-// Artwork buffer and state (static storage)
-static uint8_t artwork_rgb565[80 * 80 * 2];  // 12800 bytes
-static size_t artworkSize = 0;
-static bool artworkReady = false;
-static size_t artworkWritePos = 0;  // Position for chunk assembly
+// Global artwork buffer (decoded RGB565) - NOT in the queue
+static uint8_t gArtworkRgb565[ARTWORK_RGB565_SIZE];
+static bool gArtworkNew = false;
+static uint32_t gLastArtworkHash = 0;
 
-// Helper: convert hex char to nibble
-static uint8_t hexCharToNibble(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-    return 0;
-}
-
-// Artwork chunk handling functions
-void artwork_start() {
-    artworkWritePos = 0;
-    artworkReady = false;
-    memset(artwork_rgb565, 0, sizeof(artwork_rgb565));
-    Serial.println("[ART] Start receiving artwork");
-}
-
-void artwork_chunk(const char* hexData, size_t len) {
-    // Convert hex string to bytes and append to buffer
-    // Each 2 hex chars = 1 byte
-    for (size_t i = 0; i + 1 < len && artworkWritePos < sizeof(artwork_rgb565); i += 2) {
-        uint8_t hi = hexCharToNibble(hexData[i]);
-        uint8_t lo = hexCharToNibble(hexData[i + 1]);
-        artwork_rgb565[artworkWritePos++] = (hi << 4) | lo;
+// Simple hash for change detection
+static uint32_t quickHash(const char* str, size_t len) {
+    uint32_t h = 2166136261u;
+    size_t maxLen = len > 100 ? 100 : len;
+    for (size_t i = 0; i < maxLen; ++i) {
+        h ^= (uint8_t)str[i];
+        h *= 16777619u;
     }
+    return h ^ len;
 }
 
-void artwork_end() {
-    artworkSize = artworkWritePos;
-    artworkReady = true;
-    Serial.printf("[ART] Complete: %u bytes\n", artworkSize);
+uint8_t* artwork_get_rgb565_buffer() {
+    return gArtworkRgb565;
 }
 
-uint8_t* artwork_get_buffer() {
-    return artwork_rgb565;
+bool artwork_is_new() {
+    return gArtworkNew;
 }
 
-bool artwork_is_ready() {
-    return artworkReady;
-}
-
-size_t artwork_get_size() {
-    return artworkSize;
-}
-
-void artwork_clear_ready() {
-    artworkReady = false;
+void artwork_clear_new() {
+    gArtworkNew = false;
 }
 
 // Helper to safely copy Strings into fixed buffers
@@ -67,9 +42,40 @@ static void safeStrCopy(char *dst, size_t dstSize, const String &src) {
     dst[n] = '\0';
 }
 
-// Parse JSON line into SnapshotMsg (POD struct)
+// Decode base64 artwork directly into global buffer
+static bool decodeArtworkB64(const char* b64, size_t b64Len) {
+    // Check if it's the same artwork
+    uint32_t h = quickHash(b64, b64Len);
+    if (h == gLastArtworkHash) {
+        return false;  // Same artwork, no update needed
+    }
+    
+    size_t outLen = 0;
+    int ret = mbedtls_base64_decode(
+        gArtworkRgb565,
+        sizeof(gArtworkRgb565),
+        &outLen,
+        (const unsigned char*)b64,
+        b64Len
+    );
+    
+    if (ret != 0 || outLen != ARTWORK_RGB565_SIZE) {
+        Serial.printf("[ART] Decode failed: ret=%d, size=%u (expected %u)\n", ret, outLen, ARTWORK_RGB565_SIZE);
+        return false;
+    }
+    
+    gLastArtworkHash = h;
+    gArtworkNew = true;
+    Serial.println("[ART] Decoded successfully");
+    return true;
+}
+
+// Parse JSON line into SnapshotMsg (POD struct) - artwork handled separately
 static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
-    StaticJsonDocument<2048> doc;
+    // Use DynamicJsonDocument - size based on whether artwork is present
+    size_t docSize = (input.indexOf("artwork_png_b64") > 0) ? 32768 : 2048;
+    DynamicJsonDocument doc(docSize);
+    
     DeserializationError err = deserializeJson(doc, input);
     if (err) {
         Serial.print("JSON parse error: ");
@@ -104,7 +110,6 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
                 float mem = o["mem"] | 0.0f;
                 const char *name = o["name"] | "";
                 char buf[32];
-                // Format: "1234: 45.2% name"
                 snprintf(buf, sizeof(buf), "%d: %.1f%% %s", pid, mem, name);
                 safeStrCopy(msg.procs[idx], sizeof(msg.procs[idx]), String(buf));
                 idx++;
@@ -133,11 +138,14 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
 
     // --- Media (optional "media" object from Python) ---
     msg.hasMedia = false;
+    msg.hasArtwork = false;
+    msg.artworkUpdated = false;
     msg.title[0]  = '\0';
     msg.artist[0] = '\0';
     msg.album[0]  = '\0';
     msg.position  = 0;
     msg.duration  = 0;
+    msg.isPlaying = false;
 
     if (doc.containsKey("media") && doc["media"].is<JsonObject>()) {
         JsonObject media = doc["media"].as<JsonObject>();
@@ -146,15 +154,27 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
         String album  = String(media["album"]   | "");
         int pos       = media["position_seconds"]  | 0;
         int dur       = media["duration_seconds"]  | 0;
+        bool playing  = media["is_playing"] | false;
 
         safeStrCopy(msg.title,  sizeof(msg.title),  title);
         safeStrCopy(msg.artist, sizeof(msg.artist), artist);
         safeStrCopy(msg.album,  sizeof(msg.album),  album);
         msg.position = pos;
         msg.duration = dur;
+        msg.isPlaying = playing;
         msg.hasMedia = true;
-        // Artwork detection (just check if present, don't store base64 - too large)
-        msg.hasArtwork = media.containsKey("artwork_b64");
+        
+        // Decode artwork directly into global buffer (not queued)
+        if (media.containsKey("artwork_png_b64")) {
+            const char* b64 = media["artwork_png_b64"] | "";
+            size_t b64len = strlen(b64);
+            if (b64len > 0) {
+                msg.hasArtwork = true;
+                if (decodeArtworkB64(b64, b64len)) {
+                    msg.artworkUpdated = true;
+                }
+            }
+        }
     }
 
     return true;
@@ -174,18 +194,7 @@ static void serial_task(void *pvParameters) {
                 gSerialLineBuf = "";
                 line.trim();
 
-                // Handle artwork protocol
-                if (line.startsWith("ART_START")) {
-                    artwork_start();
-                } else if (line.startsWith("ART_CHUNK:")) {
-                    // Extract hex data after "ART_CHUNK:"
-                    const char* hexData = line.c_str() + 10;  // Skip "ART_CHUNK:"
-                    size_t hexLen = line.length() - 10;
-                    artwork_chunk(hexData, hexLen);
-                } else if (line.startsWith("ART_END")) {
-                    artwork_end();
-                } else if (line.length() > 5) {
-                    // Regular JSON data
+                if (line.length() > 5) {
                     SnapshotMsg msg;
                     if (parse_json_into_msg(line, msg)) {
                         if (gSnapshotQueue) {
@@ -195,7 +204,8 @@ static void serial_task(void *pvParameters) {
                 }
             } else if (c != '\r') {
                 gSerialLineBuf += c;
-                if (gSerialLineBuf.length() > 4095) {
+                // Allow larger buffer for artwork JSON
+                if (gSerialLineBuf.length() > 65535) {
                     gSerialLineBuf = "";
                 }
             }
@@ -217,7 +227,7 @@ void start_serial_task() {
     xTaskCreatePinnedToCore(
         serial_task,
         "SerialTask",
-        4096,       // Reduced stack - struct is smaller now
+        12288,      // 12KB stack - enough for JSON parsing
         nullptr,
         1,          // priority
         nullptr,
