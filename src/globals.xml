@@ -1,64 +1,150 @@
 <globals xmlns="http://lvgl.io/xml/ui/1.0">
 
+  <!-- ===== SCREEN & CONTAINER STYLES ===== -->
+
   <!-- Screen background: dark vertical gradient -->
-  <style id="dark_screen" target="*">
+  <style id="dark_screen">
     <prop name="bg_color" value="#000000"/>
-    <prop name="bg_grad_color" value="#101010"/>
+    <prop name="bg_grad_color" value="#101018"/>
     <prop name="bg_grad_dir" value="VER"/>
+    <prop name="bg_opa" value="255"/>
   </style>
 
   <!-- Card container: rounded, slightly raised -->
   <style id="dark_card">
     <prop name="radius" value="8"/>
-    <prop name="bg_color" value="#202020"/>
-    <prop name="bg_opa" value="COVER"/>
+    <prop name="bg_color" value="#1a1a2e"/>
+    <prop name="bg_opa" value="255"/>
     <prop name="border_width" value="1"/>
-    <prop name="border_color" value="#404040"/>
-    <prop name="shadow_width" value="8"/>
+    <prop name="border_color" value="#303050"/>
+    <prop name="shadow_width" value="6"/>
+    <prop name="shadow_opa" value="128"/>
     <prop name="shadow_color" value="#000000"/>
     <prop name="pad_all" value="8"/>
   </style>
 
-  <!-- Primary label: white -->
+  <!-- ===== LABEL STYLES ===== -->
+
+  <!-- Primary label: white text -->
   <style id="label_primary">
     <prop name="text_color" value="#FFFFFF"/>
   </style>
 
   <!-- Secondary label: muted gray -->
   <style id="label_secondary">
-    <prop name="text_color" value="#A0A0A0"/>
+    <prop name="text_color" value="#909090"/>
   </style>
+
+  <!-- Colored labels for gauges -->
+  <style id="label_cyan">
+    <prop name="text_color" value="#00E5FF"/>
+  </style>
+
+  <style id="label_orange">
+    <prop name="text_color" value="#FF9800"/>
+  </style>
+
+  <style id="label_green">
+    <prop name="text_color" value="#4CAF50"/>
+  </style>
+
+  <!-- ===== TABVIEW STYLES ===== -->
 
   <!-- Tabview background -->
   <style id="tabview_bg">
     <prop name="bg_color" value="#000000"/>
-    <prop name="bg_opa" value="COVER"/>
+    <prop name="bg_opa" value="255"/>
   </style>
 
-  <!-- Tab buttons (top tabs) -->
+  <!-- Tab buttons (top tabs) - default state -->
   <style id="tab_btn">
-    <state name="DEFAULT">
-      <prop name="bg_color" value="#202020"/>
-      <prop name="bg_opa" value="COVER"/>
-      <prop name="text_color" value="#CCCCCC"/>
-      <prop name="pad_left" value="8"/>
-      <prop name="pad_right" value="8"/>
-    </state>
-    <state name="CHECKED">
-      <prop name="bg_color" value="#404040"/>
-      <prop name="text_color" value="#FFFFFF"/>
-    </state>
+    <prop name="bg_color" value="#1a1a2e"/>
+    <prop name="bg_opa" value="255"/>
+    <prop name="text_color" value="#AAAAAA"/>
+    <prop name="pad_left" value="10"/>
+    <prop name="pad_right" value="10"/>
+    <prop name="pad_top" value="6"/>
+    <prop name="pad_bottom" value="6"/>
   </style>
 
-  <!-- Progress bar styling for music position -->
-  <style id="progress_bar_dark">
-    <prop name="bg_color" value="#303030"/>
-    <prop name="bg_opa" value="COVER"/>
-    <prop name="pad_all" value="0"/>
-    <part name="INDICATOR">
-      <prop name="bg_color" value="#00BFA5"/>
-      <prop name="bg_opa" value="COVER"/>
-    </part>
+  <!-- Tab buttons - checked/active state -->
+  <style id="tab_btn_checked">
+    <prop name="bg_color" value="#303050"/>
+    <prop name="text_color" value="#FFFFFF"/>
+  </style>
+
+  <!-- ===== PROGRESS BAR STYLES ===== -->
+
+  <!-- Progress bar main (background track) -->
+  <style id="progress_bar_bg">
+    <prop name="bg_color" value="#303050"/>
+    <prop name="bg_opa" value="255"/>
+    <prop name="radius" value="5"/>
+  </style>
+
+  <!-- Progress bar indicator (filled part) -->
+  <style id="progress_bar_indicator">
+    <prop name="bg_color" value="#00BFA5"/>
+    <prop name="bg_opa" value="255"/>
+    <prop name="radius" value="5"/>
+  </style>
+
+  <!-- ===== ARC STYLES (for CPU/MEM/GPU gauges) ===== -->
+
+  <!-- Arc background track -->
+  <style id="arc_bg">
+    <prop name="arc_color" value="#303050"/>
+    <prop name="arc_width" value="6"/>
+  </style>
+
+  <!-- Arc indicator - cyan (CPU) -->
+  <style id="arc_cyan">
+    <prop name="arc_color" value="#00E5FF"/>
+    <prop name="arc_width" value="6"/>
+  </style>
+
+  <!-- Arc indicator - orange (MEM) -->
+  <style id="arc_orange">
+    <prop name="arc_color" value="#FF9800"/>
+    <prop name="arc_width" value="6"/>
+  </style>
+
+  <!-- Arc indicator - green (GPU) -->
+  <style id="arc_green">
+    <prop name="arc_color" value="#4CAF50"/>
+    <prop name="arc_width" value="6"/>
+  </style>
+
+  <!-- ===== LIST STYLES ===== -->
+
+  <!-- List container -->
+  <style id="list_bg">
+    <prop name="bg_color" value="#151525"/>
+    <prop name="bg_opa" value="255"/>
+    <prop name="border_width" value="0"/>
+    <prop name="pad_all" value="2"/>
+    <prop name="radius" value="4"/>
+  </style>
+
+  <!-- List button/row item -->
+  <style id="list_btn">
+    <prop name="bg_color" value="#1a1a2e"/>
+    <prop name="bg_opa" value="255"/>
+    <prop name="text_color" value="#DDDDDD"/>
+    <prop name="pad_left" value="6"/>
+    <prop name="pad_right" value="6"/>
+    <prop name="pad_top" value="4"/>
+    <prop name="pad_bottom" value="4"/>
+    <prop name="radius" value="4"/>
+  </style>
+
+  <!-- ===== ARTWORK PLACEHOLDER ===== -->
+
+  <style id="artwork_placeholder">
+    <prop name="bg_color" value="#303050"/>
+    <prop name="bg_opa" value="255"/>
+    <prop name="radius" value="6"/>
+    <prop name="border_width" value="0"/>
   </style>
 
 </globals>

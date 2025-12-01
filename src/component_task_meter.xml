@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  component_task_meter.xml
+  Reusable task meter card with CPU/MEM/GPU arcs + labels
+  Width: ~125px, fits left side of Tasks tab
+-->
+<component xmlns="http://lvgl.io/xml/ui/1.0" id="task_meter_card">
+
+  <!-- Main container card -->
+  <obj id="meter_card_root" style="dark_card"
+       width="125" height="185"
+       layout="FLEX" flex_flow="COLUMN" flex_align_main="START"
+       flex_align_cross="CENTER"
+       pad_all="4" pad_row="4">
+
+    <!-- Arc container: stacked concentric arcs -->
+    <obj id="arcs_container" width="110" height="95">
+
+      <!-- CPU Arc (outermost, cyan) -->
+      <arc id="cpu_arc" style="arc_bg"
+           width="90" height="90"
+           align="TOP_MID"
+           rotation="135"
+           bg_start_angle="0" bg_end_angle="270"
+           range_min="0" range_max="100" value="0"
+           mode="NORMAL">
+        <style_indicator style="arc_cyan"/>
+        <style_knob hidden="true"/>
+      </arc>
+
+      <!-- MEM Arc (middle, orange) -->
+      <arc id="mem_arc" style="arc_bg"
+           width="70" height="70"
+           align="TOP_MID" y="10"
+           rotation="135"
+           bg_start_angle="0" bg_end_angle="270"
+           range_min="0" range_max="100" value="0"
+           mode="NORMAL">
+        <style_indicator style="arc_orange"/>
+        <style_knob hidden="true"/>
+      </arc>
+
+      <!-- GPU Arc (innermost, green) -->
+      <arc id="gpu_arc" style="arc_bg"
+           width="50" height="50"
+           align="TOP_MID" y="20"
+           rotation="135"
+           bg_start_angle="0" bg_end_angle="270"
+           range_min="0" range_max="100" value="0"
+           mode="NORMAL">
+        <style_indicator style="arc_green"/>
+        <style_knob hidden="true"/>
+      </arc>
+
+    </obj>
+
+    <!-- Labels for each metric -->
+    <label id="cpu_label" style="label_cyan"
+           text="CPU: 0%"/>
+
+    <label id="mem_label" style="label_orange"
+           text="MEM: 0%"/>
+
+    <label id="gpu_label" style="label_green"
+           text="GPU: 0%"/>
+
+  </obj>
+
+</component>
