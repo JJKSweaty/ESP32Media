@@ -479,7 +479,8 @@ void ui_update(const SystemData &sys, const MediaData &med) {
     char buf[64];
 
     // --- Check for new artwork (decoded in data_model, stored in global buffer) ---
-    if (med.valid && med.artworkUpdated) {
+    // Always check artwork_is_new() since artwork may arrive as a standalone message
+    if (artwork_is_new()) {
         update_artwork();
     }
 

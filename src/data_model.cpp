@@ -72,9 +72,32 @@ static bool decodeArtworkB64(const char* b64, size_t b64Len) {
 
 // Parse JSON line into SnapshotMsg (POD struct) - artwork handled separately
 static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
-    // Use DynamicJsonDocument - size based on whether artwork is present
-    size_t docSize = (input.indexOf("artwork_png_b64") > 0) ? 32768 : 2048;
-    DynamicJsonDocument doc(docSize);
+    // Check if this is a standalone artwork message
+    if (input.indexOf("artwork_b64") > 0 && input.indexOf("cpu_percent") < 0) {
+        Serial.println("[ESP] Received artwork message!");
+        // This is just artwork - parse and decode it, don't update msg
+        DynamicJsonDocument doc(32768);
+        DeserializationError err = deserializeJson(doc, input);
+        if (err) {
+            Serial.print("Artwork JSON parse error: ");
+            Serial.println(err.f_str());
+            return false;
+        }
+        if (doc.containsKey("artwork_b64")) {
+            const char* b64 = doc["artwork_b64"] | "";
+            size_t b64len = strlen(b64);
+            Serial.printf("[ESP] artwork_b64 length: %u\n", b64len);
+            if (b64len > 100) {
+                if (decodeArtworkB64(b64, b64len)) {
+                    Serial.println("[ESP] Artwork decoded successfully!");
+                }
+            }
+        }
+        return false;  // Don't queue this as a snapshot
+    }
+    
+    // Regular system snapshot - use smaller buffer
+    DynamicJsonDocument doc(2048);
     
     DeserializationError err = deserializeJson(doc, input);
     if (err) {
