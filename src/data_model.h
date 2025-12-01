@@ -8,6 +8,10 @@
 #define ARTWORK_HEIGHT 80
 #define ARTWORK_RGB565_SIZE (ARTWORK_WIDTH * ARTWORK_HEIGHT * 2)  // 12800 bytes
 
+// Queue/Playlist limits (memory-constrained)
+#define MAX_QUEUE_ITEMS 5
+#define MAX_STR_ESP 48
+
 struct SystemData {
     float cpu = 0.0f;
     float mem = 0.0f;
@@ -18,6 +22,28 @@ struct SystemData {
     bool valid = false;
 };
 
+// Queue item for upcoming tracks
+struct QueueItem {
+    char id[64];           // Spotify URI
+    char source[16];       // "spotify" or "local"
+    char name[MAX_STR_ESP];
+    char artist[MAX_STR_ESP];
+    char album[MAX_STR_ESP];
+    uint16_t duration;     // seconds
+    bool isLocal;
+};
+
+// Playlist context info
+struct PlaylistInfo {
+    char id[64];
+    char name[MAX_STR_ESP];
+    char snapshotId[48];
+    uint16_t totalTracks;
+    bool isPublic;
+    bool isCollaborative;
+    bool hasImage;
+};
+
 struct MediaData {
     String title;
     String artist;
@@ -25,9 +51,19 @@ struct MediaData {
     int position = 0;    // seconds
     int duration = 0;    // seconds
     bool isPlaying = false;
+    String source;       // "spotify", "youtube", "browser"
 
     bool hasArtwork = false;
     bool artworkUpdated = false;  // Set true when new artwork is ready
+
+    // Queue data
+    bool hasQueue = false;
+    uint8_t queueLen = 0;
+    QueueItem queue[MAX_QUEUE_ITEMS];
+    
+    // Playlist context
+    bool hasPlaylist = false;
+    PlaylistInfo playlist;
 
     bool valid = false;
 };
@@ -45,12 +81,22 @@ typedef struct {
     char title[64];
     char artist[64];
     char album[64];
+    char source[16];     // Media source
     int position;
     int duration;
     bool isPlaying;
     
     bool hasArtwork;       // Indicates artwork was parsed
     bool artworkUpdated;   // Indicates new artwork in global buffer
+    
+    // Queue data
+    bool hasQueue;
+    uint8_t queueLen;
+    QueueItem queue[MAX_QUEUE_ITEMS];
+    
+    // Playlist context
+    bool hasPlaylist;
+    PlaylistInfo playlist;
 } SnapshotMsg;
 
 extern QueueHandle_t gSnapshotQueue;

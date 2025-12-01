@@ -96,13 +96,15 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
         return false;  // Don't queue this as a snapshot
     }
     
-    // Regular system snapshot - use smaller buffer
-    DynamicJsonDocument doc(2048);
+    // Regular system snapshot - need larger buffer for queue data
+    // JSON size is ~2800 bytes, ArduinoJson needs ~1.5x for parsing overhead
+    DynamicJsonDocument doc(6144);
     
     DeserializationError err = deserializeJson(doc, input);
     if (err) {
         Serial.print("JSON parse error: ");
         Serial.println(err.f_str());
+        Serial.printf("  Input size: %d, Free heap: %d\n", input.length(), ESP.getFreeHeap());
         return false;
     }
 
@@ -182,15 +184,26 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
     msg.title[0]  = '\0';
     msg.artist[0] = '\0';
     msg.album[0]  = '\0';
+    msg.source[0] = '\0';
     msg.position  = 0;
     msg.duration  = 0;
     msg.isPlaying = false;
+    
+    // Initialize queue/playlist
+    msg.hasQueue = false;
+    msg.queueLen = 0;
+    msg.hasPlaylist = false;
+    memset(&msg.playlist, 0, sizeof(msg.playlist));
+    for (int i = 0; i < MAX_QUEUE_ITEMS; ++i) {
+        memset(&msg.queue[i], 0, sizeof(QueueItem));
+    }
 
     if (doc.containsKey("media") && doc["media"].is<JsonObject>()) {
         JsonObject media = doc["media"].as<JsonObject>();
         String title  = String(media["title"]   | "No media");
         String artist = String(media["artist"]  | "");
         String album  = String(media["album"]   | "");
+        String source = String(media["source"]  | "");
         int pos       = media["position_seconds"]  | 0;
         int dur       = media["duration_seconds"]  | 0;
         bool playing  = media["is_playing"] | false;
@@ -198,10 +211,47 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
         safeStrCopy(msg.title,  sizeof(msg.title),  title);
         safeStrCopy(msg.artist, sizeof(msg.artist), artist);
         safeStrCopy(msg.album,  sizeof(msg.album),  album);
+        safeStrCopy(msg.source, sizeof(msg.source), source);
         msg.position = pos;
         msg.duration = dur;
         msg.isPlaying = playing;
         msg.hasMedia = true;
+        
+        // Parse playlist context if present
+        if (media.containsKey("playlist") && media["playlist"].is<JsonObject>()) {
+            JsonObject pl = media["playlist"].as<JsonObject>();
+            msg.hasPlaylist = true;
+            safeStrCopy(msg.playlist.id, sizeof(msg.playlist.id), String(pl["id"] | ""));
+            safeStrCopy(msg.playlist.name, sizeof(msg.playlist.name), String(pl["name"] | ""));
+            safeStrCopy(msg.playlist.snapshotId, sizeof(msg.playlist.snapshotId), String(pl["snapshot_id"] | ""));
+            msg.playlist.totalTracks = pl["total_tracks"] | 0;
+            msg.playlist.isPublic = pl["is_public"] | false;
+            msg.playlist.isCollaborative = pl["is_collaborative"] | false;
+            msg.playlist.hasImage = pl.containsKey("image_thumb_jpg_b64") && strlen(pl["image_thumb_jpg_b64"] | "") > 0;
+        }
+        
+        // Parse queue if present
+        if (media.containsKey("queue") && media["queue"].is<JsonArray>()) {
+            JsonArray qArr = media["queue"].as<JsonArray>();
+            msg.hasQueue = true;
+            uint8_t idx = 0;
+            for (JsonVariant v : qArr) {
+                if (idx >= MAX_QUEUE_ITEMS) break;
+                if (!v.is<JsonObject>()) continue;
+                JsonObject q = v.as<JsonObject>();
+                
+                QueueItem &item = msg.queue[idx];
+                safeStrCopy(item.id, sizeof(item.id), String(q["id"] | ""));
+                safeStrCopy(item.source, sizeof(item.source), String(q["source"] | "spotify"));
+                safeStrCopy(item.name, sizeof(item.name), String(q["name"] | ""));
+                safeStrCopy(item.artist, sizeof(item.artist), String(q["artist"] | ""));
+                safeStrCopy(item.album, sizeof(item.album), String(q["album"] | ""));
+                item.duration = q["duration_seconds"] | 0;
+                item.isLocal = q["is_local"] | false;
+                idx++;
+            }
+            msg.queueLen = idx;
+        }
         
         // Decode artwork directly into global buffer (not queued)
         if (media.containsKey("artwork_png_b64")) {
@@ -266,7 +316,7 @@ void start_serial_task() {
     xTaskCreatePinnedToCore(
         serial_task,
         "SerialTask",
-        12288,      // 12KB stack - enough for JSON parsing
+        16384,      // 16KB stack - enough for JSON parsing with queue data
         nullptr,
         1,          // priority
         nullptr,

@@ -45,8 +45,20 @@ struct MusicUI {
     lv_obj_t *play_pause_btn;  // Single toggle button
     lv_obj_t *play_pause_label; // Label to update icon
     bool is_playing;           // Track current state
+    // Queue page elements
+    lv_obj_t *now_playing_page; // Main music page
+    lv_obj_t *queue_page;       // Queue page container
+    lv_obj_t *queue_btn;        // Button to open queue
+    lv_obj_t *back_btn;         // Button to go back from queue
+    lv_obj_t *queue_title;      // Queue page title
+    lv_obj_t *queue_list;       // List widget for queue items
+    lv_obj_t *playlist_label;   // Current playlist name on queue page
 };
 static MusicUI musicUi;
+
+// Cache for queue to detect changes
+static char gLastQueueItems[MAX_QUEUE_ITEMS][MAX_STR_ESP];
+static uint8_t gLastQueueLen = 255;
 
 // Kill button callback for process list
 static void kill_proc_event_cb(lv_event_t *e) {
@@ -135,6 +147,32 @@ static void prev_event_cb(lv_event_t *e) {
     Serial.print(cmd);
 }
 
+// Queue item click - play this track immediately
+static void queue_item_click_cb(lv_event_t *e) {
+    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+    void *ud = lv_obj_get_user_data(btn);
+    if (ud) {
+        int idx = (int)(intptr_t)ud;
+        char out[64];
+        snprintf(out, sizeof(out), "{\"cmd\":\"queue_action\",\"action\":\"play_now\",\"index\":%d}\n", idx);
+        Serial.print(out);
+    }
+}
+
+// Navigate to queue page
+static void show_queue_page_cb(lv_event_t *e) {
+    (void)e;
+    if (musicUi.now_playing_page) lv_obj_add_flag(musicUi.now_playing_page, LV_OBJ_FLAG_HIDDEN);
+    if (musicUi.queue_page) lv_obj_remove_flag(musicUi.queue_page, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Navigate back to now playing page
+static void show_now_playing_cb(lv_event_t *e) {
+    (void)e;
+    if (musicUi.queue_page) lv_obj_add_flag(musicUi.queue_page, LV_OBJ_FLAG_HIDDEN);
+    if (musicUi.now_playing_page) lv_obj_remove_flag(musicUi.now_playing_page, LV_OBJ_FLAG_HIDDEN);
+}
+
 // Throttle UI updates
 static uint32_t gLastUpdateMs = 0;
 static const uint32_t UPDATE_INTERVAL_MS = 100;  // 100ms = 10 updates/sec
@@ -187,8 +225,15 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
     lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Main card
-    lv_obj_t *card = lv_obj_create(parent);
+    // ========== NOW PLAYING PAGE ==========
+    lv_obj_t *now_playing_page = lv_obj_create(parent);
+    lv_obj_remove_style_all(now_playing_page);
+    lv_obj_set_size(now_playing_page, 320, 200);
+    lv_obj_align(now_playing_page, LV_ALIGN_TOP_MID, 0, 0);
+    musicUi.now_playing_page = now_playing_page;
+
+    // Main card - now playing info
+    lv_obj_t *card = lv_obj_create(now_playing_page);
     lv_obj_remove_style_all(card);
     lv_obj_add_style(card, &style_card, 0);
     lv_obj_set_size(card, 310, 185);
@@ -202,6 +247,7 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_set_style_bg_color(art_container, lv_color_hex(0x303050), 0);
     lv_obj_set_style_border_width(art_container, 0, 0);
     lv_obj_set_style_pad_all(art_container, 0, 0);
+    lv_obj_set_style_clip_corner(art_container, true, 0);
     lv_obj_remove_flag(art_container, LV_OBJ_FLAG_SCROLLABLE);
     
     // Image widget for artwork (hidden until we have data)
@@ -239,6 +285,18 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_set_width(album, 210);
     lv_obj_align(album, LV_ALIGN_TOP_LEFT, 90, 50);
 
+    // Queue button - top right corner of card
+    lv_obj_t *queue_btn = lv_btn_create(card);
+    lv_obj_set_size(queue_btn, 70, 26);
+    lv_obj_align(queue_btn, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(queue_btn, lv_color_hex(0x303050), 0);
+    lv_obj_t *queue_btn_label = lv_label_create(queue_btn);
+    lv_label_set_text(queue_btn_label, "Queue " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(queue_btn_label, &lv_font_montserrat_12, 0);
+    lv_obj_center(queue_btn_label);
+    lv_obj_add_event_cb(queue_btn, show_queue_page_cb, LV_EVENT_CLICKED, NULL);
+    musicUi.queue_btn = queue_btn;
+
     // Progress bar - positioned above controls
     lv_obj_t *bar = lv_bar_create(card);
     lv_obj_set_size(bar, 290, 8);
@@ -265,7 +323,7 @@ static void build_music_tab(lv_obj_t *parent) {
     musicUi.progress_bar = bar;
     musicUi.progress_label = time_label;
 
-    // Controls: back / play-pause / next - at bottom (3 buttons instead of 4)
+    // Controls: back / play-pause / next - at bottom
     lv_obj_t *controls = lv_obj_create(card);
     lv_obj_remove_style_all(controls);
     lv_obj_set_size(controls, 200, 30);
@@ -301,6 +359,53 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_label_set_text(next_label, LV_SYMBOL_NEXT);
     lv_obj_center(next_label);
     lv_obj_add_event_cb(next_btn, next_event_cb, LV_EVENT_CLICKED, NULL);
+
+    // ========== QUEUE PAGE (initially hidden) ==========
+    lv_obj_t *queue_page = lv_obj_create(parent);
+    lv_obj_remove_style_all(queue_page);
+    lv_obj_set_size(queue_page, 320, 200);
+    lv_obj_align(queue_page, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_add_flag(queue_page, LV_OBJ_FLAG_HIDDEN);  // Start hidden
+    musicUi.queue_page = queue_page;
+
+    // Queue card
+    lv_obj_t *queue_card = lv_obj_create(queue_page);
+    lv_obj_remove_style_all(queue_card);
+    lv_obj_add_style(queue_card, &style_card, 0);
+    lv_obj_set_size(queue_card, 310, 185);
+    lv_obj_align(queue_card, LV_ALIGN_TOP_MID, 0, 2);
+
+    // Back button - top left
+    lv_obj_t *back_btn = lv_btn_create(queue_card);
+    lv_obj_set_size(back_btn, 70, 26);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x303050), 0);
+    lv_obj_t *back_label = lv_label_create(back_btn);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(back_label, &lv_font_montserrat_12, 0);
+    lv_obj_center(back_label);
+    lv_obj_add_event_cb(back_btn, show_now_playing_cb, LV_EVENT_CLICKED, NULL);
+    musicUi.back_btn = back_btn;
+
+    // Queue title / playlist name - centered at top
+    lv_obj_t *playlist_label = lv_label_create(queue_card);
+    lv_obj_add_style(playlist_label, &style_label_primary, 0);
+    lv_label_set_text(playlist_label, "Up Next");
+    lv_label_set_long_mode(playlist_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(playlist_label, 150);
+    lv_obj_align(playlist_label, LV_ALIGN_TOP_MID, 0, 4);
+    musicUi.playlist_label = playlist_label;
+
+    // Queue list - scrollable
+    lv_obj_t *queue_list = lv_list_create(queue_card);
+    lv_obj_set_size(queue_list, 294, 145);
+    lv_obj_align(queue_list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(queue_list, lv_color_hex(0x151525), 0);
+    lv_obj_set_style_border_width(queue_list, 0, 0);
+    lv_obj_set_style_pad_all(queue_list, 4, 0);
+    lv_obj_set_style_pad_row(queue_list, 4, 0);
+    musicUi.queue_list = queue_list;
+    musicUi.queue_title = playlist_label;
 }
 
 // --- TASK TAB --- (using arcs for LVGL 9)
@@ -619,6 +724,79 @@ void ui_update(const SystemData &sys, const MediaData &med) {
             // No artwork yet - show icon
             lv_obj_remove_flag(musicUi.art_icon, LV_OBJ_FLAG_HIDDEN);
             if (musicUi.art_img) lv_obj_add_flag(musicUi.art_img, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        // --- Update playlist/queue title ---
+        if (musicUi.playlist_label) {
+            if (med.hasPlaylist && strlen(med.playlist.name) > 0) {
+                lv_label_set_text(musicUi.playlist_label, med.playlist.name);
+            } else {
+                lv_label_set_text(musicUi.playlist_label, "Up Next");
+            }
+        }
+
+        // --- Update queue list ---
+        if (musicUi.queue_list) {
+            // Check if queue changed
+            bool queueChanged = (med.queueLen != gLastQueueLen);
+            if (!queueChanged) {
+                for (uint8_t i = 0; i < med.queueLen && i < MAX_QUEUE_ITEMS; ++i) {
+                    if (strcmp(med.queue[i].name, gLastQueueItems[i]) != 0) {
+                        queueChanged = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (queueChanged) {
+                lv_obj_clean(musicUi.queue_list);
+                
+                for (uint8_t i = 0; i < med.queueLen && i < MAX_QUEUE_ITEMS; ++i) {
+                    if (strlen(med.queue[i].name) == 0) continue;
+                    
+                    // Create a compact clickable button for each queue item
+                    lv_obj_t *item_btn = lv_btn_create(musicUi.queue_list);
+                    lv_obj_set_size(item_btn, LV_PCT(100), 32);
+                    lv_obj_set_style_bg_color(item_btn, lv_color_hex(0x202040), 0);
+                    lv_obj_set_style_bg_opa(item_btn, LV_OPA_COVER, 0);
+                    lv_obj_set_style_radius(item_btn, 4, 0);
+                    lv_obj_set_style_pad_all(item_btn, 4, 0);
+                    
+                    // Index number
+                    lv_obj_t *idx_label = lv_label_create(item_btn);
+                    snprintf(buf, sizeof(buf), "%d.", i + 1);
+                    lv_label_set_text(idx_label, buf);
+                    lv_obj_set_style_text_font(idx_label, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(idx_label, lv_color_hex(0x808080), 0);
+                    lv_obj_align(idx_label, LV_ALIGN_LEFT_MID, 2, 0);
+                    
+                    // Track name (truncated)
+                    lv_obj_t *name_label = lv_label_create(item_btn);
+                    lv_obj_add_style(name_label, &style_label_primary, 0);
+                    lv_label_set_text(name_label, med.queue[i].name);
+                    lv_obj_set_style_text_font(name_label, &lv_font_montserrat_12, 0);
+                    lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+                    lv_obj_set_width(name_label, 200);
+                    lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 24, 0);
+                    
+                    // Artist name (smaller, secondary color)
+                    lv_obj_t *artist_label = lv_label_create(item_btn);
+                    lv_obj_add_style(artist_label, &style_label_secondary, 0);
+                    lv_label_set_text(artist_label, med.queue[i].artist);
+                    lv_obj_set_style_text_font(artist_label, &lv_font_montserrat_12, 0);
+                    lv_label_set_long_mode(artist_label, LV_LABEL_LONG_DOT);
+                    lv_obj_set_width(artist_label, 60);
+                    lv_obj_align(artist_label, LV_ALIGN_RIGHT_MID, -2, 0);
+                    
+                    // Store index for callback
+                    lv_obj_set_user_data(item_btn, (void*)(intptr_t)i);
+                    lv_obj_add_event_cb(item_btn, queue_item_click_cb, LV_EVENT_CLICKED, NULL);
+                    
+                    strncpy(gLastQueueItems[i], med.queue[i].name, MAX_STR_ESP - 1);
+                    gLastQueueItems[i][MAX_STR_ESP - 1] = '\0';
+                }
+                gLastQueueLen = med.queueLen;
+            }
         }
     }
 }

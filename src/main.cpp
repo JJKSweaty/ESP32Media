@@ -125,6 +125,7 @@ void loop() {
             med.title = String(msg.title);
             med.artist = String(msg.artist);
             med.album = String(msg.album);
+            med.source = String(msg.source);
             med.position = msg.position;
             med.duration = msg.duration;
             med.isPlaying = msg.isPlaying;
@@ -133,10 +134,25 @@ void loop() {
             // Artwork is decoded directly into global buffer by data_model
             med.hasArtwork = msg.hasArtwork;
             med.artworkUpdated = msg.artworkUpdated;
+            
+            // Copy queue data
+            med.hasQueue = msg.hasQueue;
+            med.queueLen = msg.queueLen;
+            for (uint8_t i = 0; i < msg.queueLen && i < MAX_QUEUE_ITEMS; ++i) {
+                med.queue[i] = msg.queue[i];
+            }
+            
+            // Copy playlist context
+            med.hasPlaylist = msg.hasPlaylist;
+            if (msg.hasPlaylist) {
+                med.playlist = msg.playlist;
+            }
         } else {
             med.valid = false;
             med.hasArtwork = false;
             med.artworkUpdated = false;
+            med.hasQueue = false;
+            med.hasPlaylist = false;
         }
 
         ui_update(sys, med);
