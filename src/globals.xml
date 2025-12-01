@@ -1,0 +1,64 @@
+<globals xmlns="http://lvgl.io/xml/ui/1.0">
+
+  <!-- Screen background: dark vertical gradient -->
+  <style id="dark_screen" target="*">
+    <prop name="bg_color" value="#000000"/>
+    <prop name="bg_grad_color" value="#101010"/>
+    <prop name="bg_grad_dir" value="VER"/>
+  </style>
+
+  <!-- Card container: rounded, slightly raised -->
+  <style id="dark_card">
+    <prop name="radius" value="8"/>
+    <prop name="bg_color" value="#202020"/>
+    <prop name="bg_opa" value="COVER"/>
+    <prop name="border_width" value="1"/>
+    <prop name="border_color" value="#404040"/>
+    <prop name="shadow_width" value="8"/>
+    <prop name="shadow_color" value="#000000"/>
+    <prop name="pad_all" value="8"/>
+  </style>
+
+  <!-- Primary label: white -->
+  <style id="label_primary">
+    <prop name="text_color" value="#FFFFFF"/>
+  </style>
+
+  <!-- Secondary label: muted gray -->
+  <style id="label_secondary">
+    <prop name="text_color" value="#A0A0A0"/>
+  </style>
+
+  <!-- Tabview background -->
+  <style id="tabview_bg">
+    <prop name="bg_color" value="#000000"/>
+    <prop name="bg_opa" value="COVER"/>
+  </style>
+
+  <!-- Tab buttons (top tabs) -->
+  <style id="tab_btn">
+    <state name="DEFAULT">
+      <prop name="bg_color" value="#202020"/>
+      <prop name="bg_opa" value="COVER"/>
+      <prop name="text_color" value="#CCCCCC"/>
+      <prop name="pad_left" value="8"/>
+      <prop name="pad_right" value="8"/>
+    </state>
+    <state name="CHECKED">
+      <prop name="bg_color" value="#404040"/>
+      <prop name="text_color" value="#FFFFFF"/>
+    </state>
+  </style>
+
+  <!-- Progress bar styling for music position -->
+  <style id="progress_bar_dark">
+    <prop name="bg_color" value="#303030"/>
+    <prop name="bg_opa" value="COVER"/>
+    <prop name="pad_all" value="0"/>
+    <part name="INDICATOR">
+      <prop name="bg_color" value="#00BFA5"/>
+      <prop name="bg_opa" value="COVER"/>
+    </part>
+  </style>
+
+</globals>

@@ -1,6 +1,12 @@
+/**
+ * @file ui.cpp
+ * LVGL 9.x UI for ESP32 Media Tracker
+ * 
+ * Uses arcs instead of meter (meter removed in LVGL 9)
+ */
+
 #include "ui.h"
 #include <math.h>
-#include "mbedtls/base64.h"
 
 // --- Styles ---
 static lv_style_t style_screen_bg;
@@ -8,13 +14,14 @@ static lv_style_t style_card;
 static lv_style_t style_label_primary;
 static lv_style_t style_label_secondary;
 
-// --- Task UI holder ---
+// --- Task UI holder (using arcs instead of meter in LVGL 9) ---
 struct TaskUI {
-    lv_obj_t *meter;
-    lv_meter_indicator_t *cpu_arc;
-    lv_meter_indicator_t *mem_arc;
+    lv_obj_t *cpu_arc;
+    lv_obj_t *mem_arc;
+    lv_obj_t *gpu_arc;
     lv_obj_t *cpu_label;
     lv_obj_t *mem_label;
+    lv_obj_t *gpu_label;
     lv_obj_t *proc_list;
 };
 static TaskUI taskUi;
@@ -30,21 +37,29 @@ struct MusicUI {
 };
 static MusicUI musicUi;
 
-// Artwork buffer + descriptor
-static uint8_t gArtworkPngBuf[32768];
-static lv_img_dsc_t gArtworkImg;
-static bool gArtworkImgInited = false;
-static uint32_t gLastArtworkHash = 0;
-
-// Simple hash to avoid decoding same image repeatedly
-static uint32_t simpleHash(const String &s) {
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < s.length(); ++i) {
-        h ^= (uint8_t)s[i];
-        h *= 16777619u;
+// Kill button callback for process list
+static void kill_proc_event_cb(lv_event_t *e) {
+    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+    // First child of list button is the label
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (label) {
+        const char *txt = lv_label_get_text(label);
+        // For now: just print to Serial.
+        // Later you can parse the name and send a command back to Python.
+        Serial.print("[UI] Kill requested for: ");
+        Serial.println(txt);
     }
-    return h;
 }
+
+// Throttle UI updates
+static uint32_t gLastUpdateMs = 0;
+static const uint32_t UPDATE_INTERVAL_MS = 100;  // 100ms = 10 updates/sec
+
+// Cache last values to avoid redundant updates
+static int gLastCpu = -1, gLastMem = -1, gLastGpu = -1;
+static String gLastProcs[5];
+static uint8_t gLastProcCount = 255;
+static String gLastTitle = "";
 
 static void format_time(char *buf, size_t buf_len, int seconds) {
     if (seconds < 0) seconds = 0;
@@ -53,85 +68,92 @@ static void format_time(char *buf, size_t buf_len, int seconds) {
     snprintf(buf, buf_len, "%d:%02d", m, s);
 }
 
-// --- Styles: simple high-contrast dark theme ---
+// --- Styles ---
 static void init_styles() {
     lv_style_init(&style_screen_bg);
-    lv_style_set_bg_color(&style_screen_bg, lv_color_hex(0x000000));
-    lv_style_set_bg_grad_color(&style_screen_bg, lv_color_hex(0x101010));
-    lv_style_set_bg_grad_dir(&style_screen_bg, LV_GRAD_DIR_VER);
+    lv_style_set_bg_color(&style_screen_bg, lv_color_hex(0x101018));
 
     lv_style_init(&style_card);
     lv_style_set_radius(&style_card, 8);
-    lv_style_set_bg_color(&style_card, lv_color_hex(0x202020));
+    lv_style_set_bg_color(&style_card, lv_color_hex(0x1a1a2e));
     lv_style_set_bg_opa(&style_card, LV_OPA_COVER);
     lv_style_set_pad_all(&style_card, 8);
-    lv_style_set_shadow_width(&style_card, 8);
-    lv_style_set_shadow_color(&style_card, lv_color_hex(0x000000));
     lv_style_set_border_width(&style_card, 1);
-    lv_style_set_border_color(&style_card, lv_color_hex(0x404040));
+    lv_style_set_border_color(&style_card, lv_color_hex(0x303050));
 
     lv_style_init(&style_label_primary);
     lv_style_set_text_color(&style_label_primary, lv_color_hex(0xFFFFFF));
 
     lv_style_init(&style_label_secondary);
-    lv_style_set_text_color(&style_label_secondary, lv_color_hex(0xA0A0A0));
+    lv_style_set_text_color(&style_label_secondary, lv_color_hex(0x909090));
 }
 
 // --- MUSIC TAB ---
 static void build_music_tab(lv_obj_t *parent) {
     lv_obj_add_style(parent, &style_screen_bg, 0);
+    lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(parent, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    // Card: artwork + text
+    // Main card
     lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_remove_style_all(card);
     lv_obj_add_style(card, &style_card, 0);
-    lv_obj_set_size(card, 320 - 20, 150);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_size(card, 310, 185);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 2);
 
-    lv_obj_t *art = lv_img_create(card);
-    lv_obj_set_size(art, 96, 96);
-    lv_obj_set_style_radius(art, 8, 0);
-    lv_obj_set_style_bg_color(art, lv_color_hex(0x404040), 0);
-    lv_obj_set_style_bg_opa(art, LV_OPA_COVER, 0);
+    // Artwork placeholder
+    lv_obj_t *art = lv_obj_create(card);
+    lv_obj_set_size(art, 80, 80);
+    lv_obj_align(art, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_radius(art, 6, 0);
+    lv_obj_set_style_bg_color(art, lv_color_hex(0x303050), 0);
+    lv_obj_set_style_border_width(art, 0, 0);
+    
+    // Music icon placeholder
+    lv_obj_t *icon = lv_label_create(art);
+    lv_label_set_text(icon, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(icon, lv_color_hex(0x606080), 0);
+    lv_obj_center(icon);
 
-    lv_obj_t *text_col = lv_obj_create(card);
-    lv_obj_remove_style_all(text_col);
-    lv_obj_set_flex_flow(text_col, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(text_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
-    lv_obj_set_width(text_col, 320 - 20 - 96 - 30);
-
-    lv_obj_t *title = lv_label_create(text_col);
+    // Title
+    lv_obj_t *title = lv_label_create(card);
     lv_obj_add_style(title, &style_label_primary, 0);
-    lv_label_set_text(title, "No media");
+    lv_label_set_text(title, "No media playing");
     lv_label_set_long_mode(title, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(title, lv_pct(100));
+    lv_obj_set_width(title, 210);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 90, 5);
 
-    lv_obj_t *artist = lv_label_create(text_col);
+    // Artist
+    lv_obj_t *artist = lv_label_create(card);
     lv_obj_add_style(artist, &style_label_secondary, 0);
     lv_label_set_text(artist, "Artist");
+    lv_obj_set_width(artist, 210);
+    lv_obj_align(artist, LV_ALIGN_TOP_LEFT, 90, 28);
 
-    lv_obj_t *album = lv_label_create(text_col);
+    // Album
+    lv_obj_t *album = lv_label_create(card);
     lv_obj_add_style(album, &style_label_secondary, 0);
     lv_label_set_text(album, "Album");
+    lv_obj_set_width(album, 210);
+    lv_obj_align(album, LV_ALIGN_TOP_LEFT, 90, 50);
 
-    // Progress card
-    lv_obj_t *progress_card = lv_obj_create(parent);
-    lv_obj_add_style(progress_card, &style_card, 0);
-    lv_obj_set_size(progress_card, 320 - 20, 60);
-    lv_obj_set_flex_flow(progress_card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(progress_card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *bar = lv_bar_create(progress_card);
-    lv_obj_set_size(bar, 320 - 40, 12);
+    // Progress bar
+    lv_obj_t *bar = lv_bar_create(card);
+    lv_obj_set_size(bar, 290, 10);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -25);
     lv_bar_set_range(bar, 0, 100);
     lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x303050), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, lv_palette_main(LV_PALETTE_CYAN), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 5, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 5, LV_PART_INDICATOR);
 
-    lv_obj_t *time_label = lv_label_create(progress_card);
+    // Time label
+    lv_obj_t *time_label = lv_label_create(card);
     lv_obj_add_style(time_label, &style_label_secondary, 0);
     lv_label_set_text(time_label, "0:00 / 0:00");
+    lv_obj_align(time_label, LV_ALIGN_BOTTOM_MID, 0, -5);
 
     musicUi.art_img = art;
     musicUi.title_label = title;
@@ -141,188 +163,242 @@ static void build_music_tab(lv_obj_t *parent) {
     musicUi.progress_label = time_label;
 }
 
-// --- TASK TAB ---
+// --- TASK TAB --- (using arcs for LVGL 9)
 static void build_task_tab(lv_obj_t *parent) {
     lv_obj_add_style(parent, &style_screen_bg, 0);
+    lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(parent, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    // Left panel: arcs + labels
+    lv_obj_t *left_panel = lv_obj_create(parent);
+    lv_obj_remove_style_all(left_panel);
+    lv_obj_add_style(left_panel, &style_card, 0);
+    lv_obj_set_size(left_panel, 125, 185);
+    lv_obj_align(left_panel, LV_ALIGN_TOP_LEFT, 2, 2);
 
-    lv_obj_t *left_card = lv_obj_create(parent);
-    lv_obj_add_style(left_card, &style_card, 0);
-    lv_obj_set_size(left_card, 150, 240 - 60);
-    lv_obj_align(left_card, LV_ALIGN_LEFT_MID, 5, 10);
+    // CPU Arc (outermost, cyan)
+    lv_obj_t *cpu_arc = lv_arc_create(left_panel);
+    lv_obj_set_size(cpu_arc, 90, 90);
+    lv_obj_align(cpu_arc, LV_ALIGN_TOP_MID, 0, 0);
+    lv_arc_set_rotation(cpu_arc, 135);
+    lv_arc_set_bg_angles(cpu_arc, 0, 270);
+    lv_arc_set_range(cpu_arc, 0, 100);
+    lv_arc_set_value(cpu_arc, 0);
+    lv_obj_remove_style(cpu_arc, NULL, LV_PART_KNOB);
+    lv_obj_set_style_arc_width(cpu_arc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(cpu_arc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(cpu_arc, lv_color_hex(0x303050), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(cpu_arc, lv_palette_main(LV_PALETTE_CYAN), LV_PART_INDICATOR);
+    lv_obj_remove_flag(cpu_arc, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t *meter = lv_meter_create(left_card);
-    lv_obj_set_size(meter, 120, 120);
-    lv_obj_center(meter);
+    // MEM Arc (middle, orange)
+    lv_obj_t *mem_arc = lv_arc_create(left_panel);
+    lv_obj_set_size(mem_arc, 70, 70);
+    lv_obj_align(mem_arc, LV_ALIGN_TOP_MID, 0, 10);
+    lv_arc_set_rotation(mem_arc, 135);
+    lv_arc_set_bg_angles(mem_arc, 0, 270);
+    lv_arc_set_range(mem_arc, 0, 100);
+    lv_arc_set_value(mem_arc, 0);
+    lv_obj_remove_style(mem_arc, NULL, LV_PART_KNOB);
+    lv_obj_set_style_arc_width(mem_arc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(mem_arc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(mem_arc, lv_color_hex(0x303050), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(mem_arc, lv_palette_main(LV_PALETTE_ORANGE), LV_PART_INDICATOR);
+    lv_obj_remove_flag(mem_arc, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_meter_scale_t *scale = lv_meter_add_scale(meter);
-    lv_meter_set_scale_ticks(meter, scale, 11, 2, 10, lv_palette_main(LV_PALETTE_GREY));
-    lv_meter_set_scale_major_ticks(meter, scale, 1, 2, 30, lv_color_hex3(0xeee), 15);
-    lv_meter_set_scale_range(meter, scale, 0, 100, 270, 90);
+    // GPU Arc (innermost, green)
+    lv_obj_t *gpu_arc = lv_arc_create(left_panel);
+    lv_obj_set_size(gpu_arc, 50, 50);
+    lv_obj_align(gpu_arc, LV_ALIGN_TOP_MID, 0, 20);
+    lv_arc_set_rotation(gpu_arc, 135);
+    lv_arc_set_bg_angles(gpu_arc, 0, 270);
+    lv_arc_set_range(gpu_arc, 0, 100);
+    lv_arc_set_value(gpu_arc, 0);
+    lv_obj_remove_style(gpu_arc, NULL, LV_PART_KNOB);
+    lv_obj_set_style_arc_width(gpu_arc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(gpu_arc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(gpu_arc, lv_color_hex(0x303050), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(gpu_arc, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
+    lv_obj_remove_flag(gpu_arc, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_meter_indicator_t *cpu_arc = lv_meter_add_arc(meter, scale, 8, lv_palette_main(LV_PALETTE_CYAN), 0);
-    lv_meter_indicator_t *mem_arc = lv_meter_add_arc(meter, scale, 8, lv_palette_main(LV_PALETTE_ORANGE), -20);
-
-    lv_obj_t *cpu_label = lv_label_create(left_card);
+    // Labels below arcs
+    lv_obj_t *cpu_label = lv_label_create(left_panel);
     lv_obj_add_style(cpu_label, &style_label_primary, 0);
     lv_label_set_text(cpu_label, "CPU: 0%");
-    lv_obj_align(cpu_label, LV_ALIGN_BOTTOM_LEFT, 5, -30);
+    lv_obj_set_style_text_color(cpu_label, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_align(cpu_label, LV_ALIGN_BOTTOM_LEFT, 5, -45);
 
-    lv_obj_t *mem_label = lv_label_create(left_card);
+    lv_obj_t *mem_label = lv_label_create(left_panel);
     lv_obj_add_style(mem_label, &style_label_primary, 0);
     lv_label_set_text(mem_label, "MEM: 0%");
-    lv_obj_align(mem_label, LV_ALIGN_BOTTOM_LEFT, 5, -10);
+    lv_obj_set_style_text_color(mem_label, lv_palette_main(LV_PALETTE_ORANGE), 0);
+    lv_obj_align(mem_label, LV_ALIGN_BOTTOM_LEFT, 5, -25);
 
-    lv_obj_t *right_card = lv_obj_create(parent);
-    lv_obj_add_style(right_card, &style_card, 0);
-    lv_obj_set_size(right_card, 320 - 150 - 15, 240 - 60);
-    lv_obj_align(right_card, LV_ALIGN_RIGHT_MID, -5, 10);
+    lv_obj_t *gpu_label = lv_label_create(left_panel);
+    lv_obj_add_style(gpu_label, &style_label_primary, 0);
+    lv_label_set_text(gpu_label, "GPU: 0%");
+    lv_obj_set_style_text_color(gpu_label, lv_palette_main(LV_PALETTE_GREEN), 0);
+    lv_obj_align(gpu_label, LV_ALIGN_BOTTOM_LEFT, 5, -5);
 
-    lv_obj_t *list = lv_list_create(right_card);
-    lv_obj_set_size(list, lv_pct(100), lv_pct(100));
+    // Right panel: process list
+    lv_obj_t *right_panel = lv_obj_create(parent);
+    lv_obj_remove_style_all(right_panel);
+    lv_obj_add_style(right_panel, &style_card, 0);
+    lv_obj_set_size(right_panel, 180, 185);
+    lv_obj_align(right_panel, LV_ALIGN_TOP_RIGHT, -2, 2);
 
-    taskUi.meter = meter;
+    lv_obj_t *list_title = lv_label_create(right_panel);
+    lv_obj_add_style(list_title, &style_label_secondary, 0);
+    lv_label_set_text(list_title, "Top Processes");
+    lv_obj_align(list_title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *list = lv_list_create(right_panel);
+    lv_obj_set_size(list, 165, 155);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(list, lv_color_hex(0x151525), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 2, 0);
+
     taskUi.cpu_arc = cpu_arc;
     taskUi.mem_arc = mem_arc;
+    taskUi.gpu_arc = gpu_arc;
     taskUi.cpu_label = cpu_label;
     taskUi.mem_label = mem_label;
+    taskUi.gpu_label = gpu_label;
     taskUi.proc_list = list;
 }
 
 // --- DISCORD TAB ---
 static void build_discord_tab(lv_obj_t *parent) {
     lv_obj_add_style(parent, &style_screen_bg, 0);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_add_style(card, &style_card, 0);
-    lv_obj_set_size(card, 320 - 20, 240 - 80);
+    lv_obj_set_size(card, 300, 160);
     lv_obj_center(card);
 
     lv_obj_t *label = lv_label_create(card);
     lv_obj_add_style(label, &style_label_primary, 0);
-    lv_label_set_text(label, "Discord overlay\nComing soon");
+    lv_label_set_text(label, "Discord\nComing soon");
     lv_obj_center(label);
 }
 
 // --- SETTINGS TAB ---
 static void build_settings_tab(lv_obj_t *parent) {
     lv_obj_add_style(parent, &style_screen_bg, 0);
-
-    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(parent, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_add_style(card, &style_card, 0);
-    lv_obj_set_size(card, 320 - 20, 240 - 80);
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 10);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_size(card, 300, 160);
+    lv_obj_center(card);
 
     lv_obj_t *title = lv_label_create(card);
     lv_obj_add_style(title, &style_label_primary, 0);
     lv_label_set_text(title, "Settings");
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *desc = lv_label_create(card);
     lv_obj_add_style(desc, &style_label_secondary, 0);
-    lv_label_set_text(desc, "Future options: theme, brightness,\nupdate interval, etc.");
-}
-
-// --- Artwork decode + update ---
-static void update_artwork(const MediaData &med) {
-    if (!musicUi.art_img) return;
-    if (!med.hasArtwork || med.artwork_b64.length() == 0) return;
-
-    uint32_t h = simpleHash(med.artwork_b64);
-    if (gArtworkImgInited && h == gLastArtworkHash) {
-        return; // same image as last time
-    }
-
-    size_t out_len = 0;
-    int ret = mbedtls_base64_decode(
-        gArtworkPngBuf,
-        sizeof(gArtworkPngBuf),
-        &out_len,
-        (const unsigned char *)med.artwork_b64.c_str(),
-        med.artwork_b64.length()
-    );
-
-    if (ret != 0) {
-        Serial.println("Base64 decode failed for artwork");
-        return;
-    }
-
-    memset(&gArtworkImg, 0, sizeof(gArtworkImg));
-    gArtworkImg.header.always_zero = 0;
-    gArtworkImg.header.w = 0;
-    gArtworkImg.header.h = 0;
-    gArtworkImg.header.cf = LV_IMG_CF_RAW;   // PNG in memory
-    gArtworkImg.data_size = out_len;
-    gArtworkImg.data = gArtworkPngBuf;
-
-    gArtworkImgInited = true;
-    gLastArtworkHash = h;
-
-    lv_img_set_src(musicUi.art_img, &gArtworkImg);
+    lv_label_set_text(desc, "Theme, brightness,\nupdate interval...");
+    lv_obj_align(desc, LV_ALIGN_TOP_LEFT, 0, 25);
 }
 
 // --- Public API ---
 
 void ui_init() {
-    // register PNG decoder (once)
-    lv_png_init();
     init_styles();
 
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *scr = lv_screen_active();
     lv_obj_add_style(scr, &style_screen_bg, 0);
 
-    lv_obj_t *tabview = lv_tabview_create(scr, LV_DIR_TOP, 40);
+    // LVGL 9 tabview API
+    lv_obj_t *tabview = lv_tabview_create(scr);
+    lv_tabview_set_tab_bar_position(tabview, LV_DIR_TOP);
+    lv_tabview_set_tab_bar_size(tabview, 35);
     lv_obj_set_size(tabview, 320, 240);
     lv_obj_align(tabview, LV_ALIGN_TOP_MID, 0, 0);
 
     lv_obj_t *tab_music   = lv_tabview_add_tab(tabview, "Music");
-    lv_obj_t *tab_discord = lv_tabview_add_tab(tabview, "Discord");
     lv_obj_t *tab_tasks   = lv_tabview_add_tab(tabview, "Tasks");
+    lv_obj_t *tab_discord = lv_tabview_add_tab(tabview, "Discord");
     lv_obj_t *tab_settings= lv_tabview_add_tab(tabview, "Settings");
 
     build_music_tab(tab_music);
-    build_discord_tab(tab_discord);
     build_task_tab(tab_tasks);
+    build_discord_tab(tab_discord);
     build_settings_tab(tab_settings);
 }
 
 void ui_update(const SystemData &sys, const MediaData &med) {
+    // Throttle updates
+    uint32_t now = millis();
+    if (now - gLastUpdateMs < UPDATE_INTERVAL_MS) {
+        return;
+    }
+    gLastUpdateMs = now;
+
     char buf[64];
 
     // --- Tasks ---
     int cpu_i = (int)round(sys.cpu);
     int mem_i = (int)round(sys.mem);
+    int gpu_i = (int)round(sys.gpu);
 
-    if (taskUi.cpu_label) {
+    // Update arcs
+    if (taskUi.cpu_arc) lv_arc_set_value(taskUi.cpu_arc, cpu_i);
+    if (taskUi.mem_arc) lv_arc_set_value(taskUi.mem_arc, mem_i);
+    if (taskUi.gpu_arc) lv_arc_set_value(taskUi.gpu_arc, gpu_i);
+
+    // Update labels only if changed
+    if (cpu_i != gLastCpu && taskUi.cpu_label) {
         snprintf(buf, sizeof(buf), "CPU: %d%%", cpu_i);
         lv_label_set_text(taskUi.cpu_label, buf);
+        gLastCpu = cpu_i;
     }
-    if (taskUi.mem_label) {
+    if (mem_i != gLastMem && taskUi.mem_label) {
         snprintf(buf, sizeof(buf), "MEM: %d%%", mem_i);
         lv_label_set_text(taskUi.mem_label, buf);
+        gLastMem = mem_i;
     }
-    if (taskUi.meter && taskUi.cpu_arc)
-        lv_meter_set_indicator_end_value(taskUi.meter, taskUi.cpu_arc, cpu_i);
-    if (taskUi.meter && taskUi.mem_arc)
-        lv_meter_set_indicator_end_value(taskUi.meter, taskUi.mem_arc, mem_i);
+    if (gpu_i != gLastGpu && taskUi.gpu_label) {
+        snprintf(buf, sizeof(buf), "GPU: %d%%", gpu_i);
+        lv_label_set_text(taskUi.gpu_label, buf);
+        gLastGpu = gpu_i;
+    }
 
+    // Update process list only if changed
     if (taskUi.proc_list) {
-        lv_obj_clean(taskUi.proc_list);
-        for (uint8_t i = 0; i < sys.procCount; ++i) {
-            lv_list_add_text(taskUi.proc_list, sys.procs[i].c_str());
+        bool procsChanged = (sys.procCount != gLastProcCount);
+        if (!procsChanged) {
+            for (uint8_t i = 0; i < sys.procCount && i < 5; ++i) {
+                if (sys.procs[i] != gLastProcs[i]) {
+                    procsChanged = true;
+                    break;
+                }
+            }
+        }
+        if (procsChanged) {
+            lv_obj_clean(taskUi.proc_list);
+            for (uint8_t i = 0; i < sys.procCount; ++i) {
+                if (!sys.procs[i].length()) continue;
+                // Button with close icon + process text
+                lv_obj_t *btn = lv_list_add_button(taskUi.proc_list, LV_SYMBOL_CLOSE, sys.procs[i].c_str());
+                lv_obj_add_event_cb(btn, kill_proc_event_cb, LV_EVENT_CLICKED, NULL);
+                gLastProcs[i] = sys.procs[i];
+            }
+            gLastProcCount = sys.procCount;
         }
     }
 
     // --- Music ---
     if (med.valid) {
-        if (musicUi.title_label)
+        // Only update title if changed
+        if (med.title != gLastTitle && musicUi.title_label) {
             lv_label_set_text(musicUi.title_label, med.title.c_str());
+            gLastTitle = med.title;
+        }
         if (musicUi.artist_label)
             lv_label_set_text(musicUi.artist_label, med.artist.c_str());
         if (musicUi.album_label)
@@ -345,10 +421,6 @@ void ui_update(const SystemData &sys, const MediaData &med) {
             format_time(dur_str, sizeof(dur_str), dur);
             snprintf(buf, sizeof(buf), "%s / %s", pos_str, dur_str);
             lv_label_set_text(musicUi.progress_label, buf);
-        }
-
-        if (med.hasArtwork) {
-            update_artwork(med);
         }
     }
 }

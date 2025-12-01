@@ -31,6 +31,7 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
         cpu = doc["cpu_percent"].as<float>();
     msg.cpu = cpu;
     msg.mem = doc.containsKey("mem_percent") ? doc["mem_percent"].as<float>() : 0.0f;
+    msg.gpu = doc.containsKey("gpu_percent") ? doc["gpu_percent"].as<float>() : 0.0f;
 
     msg.procCount = 0;
     for (int i = 0; i < 5; ++i) {
@@ -99,13 +100,9 @@ static void serial_task(void *pvParameters) {
                 line.trim();
 
                 if (line.length() > 5) {
-                    // Serial.print("[SerialTask] RX: ");
-                    // Serial.println(line);
-
                     SnapshotMsg msg;
                     if (parse_json_into_msg(line, msg)) {
                         if (gSnapshotQueue) {
-                            // Keep only the latest snapshot in the queue
                             xQueueOverwrite(gSnapshotQueue, &msg);
                         }
                     }
@@ -123,8 +120,8 @@ static void serial_task(void *pvParameters) {
 }
 
 void data_model_init() {
-    // Queue size 1–3 is enough; we usually only care about the latest snapshot
-    gSnapshotQueue = xQueueCreate(3, sizeof(SnapshotMsg));
+    // xQueueOverwrite requires queue size of 1
+    gSnapshotQueue = xQueueCreate(1, sizeof(SnapshotMsg));
     if (!gSnapshotQueue) {
         Serial.println("[data_model] Failed to create snapshot queue!");
     }
