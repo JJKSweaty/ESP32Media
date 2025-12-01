@@ -1,0 +1,32 @@
+<globals xmlns="http://lvgl.io/xml/ui/1.0">
+
+  <!-- Viewer copy of globals.xml -->
+
+  <style id="dark_screen">
+    <prop name="bg_color" value="#000000"/>
+    <prop name="bg_grad_color" value="#101018"/>
+    <prop name="bg_grad_dir" value="VER"/>
+    <prop name="bg_opa" value="255"/>
+  </style>
+
+  <style id="dark_card">
+    <prop name="radius" value="8"/>
+    <prop name="bg_color" value="#1a1a2e"/>
+    <prop name="bg_opa" value="255"/>
+    <prop name="border_width" value="1"/>
+    <prop name="border_color" value="#303050"/>
+    <prop name="shadow_width" value="6"/>
+    <prop name="shadow_opa" value="128"/>
+    <prop name="shadow_color" value="#000000"/>
+    <prop name="pad_all" value="8"/>
+  </style>
+
+  <style id="label_primary">
+    <prop name="text_color" value="#FFFFFF"/>
+  </style>
+
+  <style id="label_secondary">
+    <prop name="text_color" value="#909090"/>
+  </style>
+
+</globals>

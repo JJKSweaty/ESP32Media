@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component xmlns="http://lvgl.io/xml/ui/1.0" id="media_progress_card">
+  <obj id="progress_card_root" style="dark_card" width="100%" height="50"/>
+</component>

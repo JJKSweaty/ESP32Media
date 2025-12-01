@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns="http://lvgl.io/xml/ui/1.0" id="main">
+
+  <obj id="screen_root" style="dark_screen" width="320" height="240">
+    <tabview id="main_tabview" style="tabview_bg"
+             width="320" height="240"
+             tab_bar_position="TOP"
+             tab_bar_size="35">
+
+      <tab id="music_tab" name="Music">
+        <obj id="music_root" style="dark_screen" width="100%" height="100%">
+          <obj id="music_header_card" style="dark_card" width="100%" height="130"/>
+          <obj id="music_progress_card" style="dark_card" width="100%" height="50"/>
+        </obj>
+      </tab>
+
+      <tab id="tasks_tab" name="Tasks">
+        <obj id="task_root" style="dark_screen" width="100%" height="100%">
+          <obj id="task_meter_card" style="dark_card" width="125" height="185"/>
+          <obj id="task_list_card" style="dark_card" width="180" height="185"/>
+        </obj>
+      </tab>
+
+      <tab id="discord_tab" name="Discord">
+        <obj id="discord_root" style="dark_screen" width="100%" height="100%">
+          <obj id="discord_card" style="dark_card" width="300" height="160"/>
+        </obj>
+      </tab>
+
+      <tab id="settings_tab" name="Settings">
+        <obj id="settings_root" style="dark_screen" width="100%" height="100%">
+          <obj id="settings_card" style="dark_card" width="300" height="160"/>
+        </obj>
+      </tab>
+
+    </tabview>
+  </obj>
+</screen>
