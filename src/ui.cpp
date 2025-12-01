@@ -47,6 +47,15 @@ struct MusicUI {
     lv_obj_t *play_pause_btn;  // Single toggle button
     lv_obj_t *play_pause_label; // Label to update icon
     bool is_playing;           // Track current state
+    // Shuffle/Repeat/Add-to-Playlist buttons
+    lv_obj_t *shuffle_btn;
+    lv_obj_t *shuffle_label;
+    lv_obj_t *repeat_btn;
+    lv_obj_t *repeat_label;
+    lv_obj_t *add_playlist_btn;
+    lv_obj_t *add_playlist_label;
+    bool shuffle_state;        // Current shuffle state
+    uint8_t repeat_state;      // 0=off, 1=track, 2=context
     // Queue page elements
     lv_obj_t *now_playing_page; // Main music page
     lv_obj_t *queue_page;       // Queue page container
@@ -177,9 +186,89 @@ static void prev_event_cb(lv_event_t *e) {
     send_command("{\"cmd\":\"previous\"}\n");
 }
 
-// Debounce for queue item clicks
+// Shuffle button callback - toggle shuffle state
+static void shuffle_event_cb(lv_event_t *e) {
+    (void)e;
+    uint32_t now = lv_tick_get();
+    if (now - gLastNavPressMs < NAV_DEBOUNCE_MS) return;
+    gLastNavPressMs = now;
+    
+    // Toggle shuffle: send opposite of current state
+    bool new_state = !musicUi.shuffle_state;
+    
+    // Immediate visual feedback
+    musicUi.shuffle_state = new_state;
+    if (new_state) {
+        lv_obj_set_style_bg_color(musicUi.shuffle_btn, lv_palette_main(LV_PALETTE_GREEN), 0);
+    } else {
+        lv_obj_set_style_bg_color(musicUi.shuffle_btn, lv_color_hex(0x404060), 0);
+    }
+    
+    char out[CMD_MAX_LEN];
+    snprintf(out, sizeof(out), "{\"cmd\":\"shuffle\",\"state\":%s}\n", new_state ? "true" : "false");
+    send_command(out);
+}
+
+// Repeat button callback - cycle through off -> context -> track -> off
+static void repeat_event_cb(lv_event_t *e) {
+    (void)e;
+    uint32_t now = lv_tick_get();
+    if (now - gLastNavPressMs < NAV_DEBOUNCE_MS) return;
+    gLastNavPressMs = now;
+    
+    // Cycle repeat state: 0=off -> 2=context -> 1=track -> 0=off
+    uint8_t new_repeat = 0;
+    const char *new_state = "off";
+    if (musicUi.repeat_state == 0) {
+        new_state = "context";
+        new_repeat = 2;
+    } else if (musicUi.repeat_state == 2) {
+        new_state = "track";
+        new_repeat = 1;
+    } else {
+        new_state = "off";
+        new_repeat = 0;
+    }
+    
+    // Immediate visual feedback
+    musicUi.repeat_state = new_repeat;
+    if (new_repeat == 1) {
+        lv_obj_set_style_bg_color(musicUi.repeat_btn, lv_palette_main(LV_PALETTE_ORANGE), 0);
+        lv_label_set_text(musicUi.repeat_label, "1");
+    } else if (new_repeat == 2) {
+        lv_obj_set_style_bg_color(musicUi.repeat_btn, lv_palette_main(LV_PALETTE_CYAN), 0);
+        lv_label_set_text(musicUi.repeat_label, LV_SYMBOL_LOOP);
+    } else {
+        lv_obj_set_style_bg_color(musicUi.repeat_btn, lv_color_hex(0x404060), 0);
+        lv_label_set_text(musicUi.repeat_label, LV_SYMBOL_LOOP);
+    }
+    
+    char out[CMD_MAX_LEN];
+    snprintf(out, sizeof(out), "{\"cmd\":\"repeat\",\"state\":\"%s\"}\n", new_state);
+    send_command(out);
+}
+
+// Add to playlist button callback - adds current track to user's default playlist
+static void add_playlist_event_cb(lv_event_t *e) {
+    (void)e;
+    uint32_t now = lv_tick_get();
+    if (now - gLastNavPressMs < NAV_DEBOUNCE_MS) return;
+    gLastNavPressMs = now;
+    
+    // Visual feedback - brief highlight
+    lv_obj_set_style_bg_color(musicUi.add_playlist_btn, lv_palette_main(LV_PALETTE_GREEN), 0);
+    
+    // Send add to playlist command
+    char out[CMD_MAX_LEN];
+    snprintf(out, sizeof(out), "{\"cmd\":\"add_to_playlist\"}\n");
+    send_command(out);
+    
+    // Reset color after brief delay (will be reset on next UI update anyway)
+}
+
+// Debounce for queue item clicks (longer to prevent memory issues)
 static uint32_t gLastQueueClickMs = 0;
-static const uint32_t QUEUE_CLICK_DEBOUNCE_MS = 500;
+static const uint32_t QUEUE_CLICK_DEBOUNCE_MS = 1000;  // 1 second debounce
 
 // Queue item click - play this track immediately
 static void queue_item_click_cb(lv_event_t *e) {
@@ -346,21 +435,20 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_set_width(album, 180);
     lv_obj_align(album, LV_ALIGN_TOP_LEFT, 90, 50);
 
-    // Queue button - hamburger menu style (≡) positioned below album art
+    // Queue button - positioned below album art (left side)
     lv_obj_t *queue_btn = lv_btn_create(card);
     lv_obj_set_size(queue_btn, 80, 24);
     lv_obj_align(queue_btn, LV_ALIGN_TOP_LEFT, 0, 85);  // Below artwork
     lv_obj_set_style_bg_color(queue_btn, lv_color_hex(0x303050), 0);
     lv_obj_set_style_radius(queue_btn, 4, 0);
     lv_obj_t *queue_btn_label = lv_label_create(queue_btn);
-    // Use three horizontal lines icon (hamburger menu style)
     lv_label_set_text(queue_btn_label, LV_SYMBOL_LIST " Queue");
     lv_obj_set_style_text_font(queue_btn_label, &lv_font_montserrat_12, 0);
     lv_obj_center(queue_btn_label);
     lv_obj_add_event_cb(queue_btn, show_queue_page_cb, LV_EVENT_CLICKED, NULL);
     musicUi.queue_btn = queue_btn;
 
-    // Progress bar - positioned above controls (card is 185px, controls at bottom)
+    // Progress bar - positioned above controls
     lv_obj_t *bar = lv_bar_create(card);
     lv_obj_set_size(bar, 290, 8);
     lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -42);
@@ -385,6 +473,57 @@ static void build_music_tab(lv_obj_t *parent) {
     musicUi.album_label = album;
     musicUi.progress_bar = bar;
     musicUi.progress_label = time_label;
+
+    // Secondary controls row: shuffle / like / repeat - positioned on the RIGHT side
+    lv_obj_t *secondary_controls = lv_obj_create(card);
+    lv_obj_remove_style_all(secondary_controls);
+    lv_obj_set_size(secondary_controls, 110, 24);
+    lv_obj_align(secondary_controls, LV_ALIGN_TOP_RIGHT, 0, 85);  // Right side, same row as queue
+    lv_obj_set_layout(secondary_controls, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(secondary_controls, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(secondary_controls, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(secondary_controls, 5, 0);
+
+    // Shuffle button
+    lv_obj_t *shuffle_btn = lv_btn_create(secondary_controls);
+    lv_obj_set_size(shuffle_btn, 32, 24);
+    lv_obj_set_style_bg_color(shuffle_btn, lv_color_hex(0x404060), 0);  // Slightly lighter default
+    lv_obj_set_style_radius(shuffle_btn, 4, 0);
+    lv_obj_t *shuffle_label = lv_label_create(shuffle_btn);
+    lv_label_set_text(shuffle_label, LV_SYMBOL_SHUFFLE);
+    lv_obj_set_style_text_font(shuffle_label, &lv_font_montserrat_12, 0);
+    lv_obj_center(shuffle_label);
+    lv_obj_add_event_cb(shuffle_btn, shuffle_event_cb, LV_EVENT_CLICKED, NULL);
+    musicUi.shuffle_btn = shuffle_btn;
+    musicUi.shuffle_label = shuffle_label;
+    musicUi.shuffle_state = false;
+
+    // Add to playlist button (+)
+    lv_obj_t *add_btn = lv_btn_create(secondary_controls);
+    lv_obj_set_size(add_btn, 32, 24);
+    lv_obj_set_style_bg_color(add_btn, lv_color_hex(0x404060), 0);
+    lv_obj_set_style_radius(add_btn, 4, 0);
+    lv_obj_t *add_label = lv_label_create(add_btn);
+    lv_label_set_text(add_label, LV_SYMBOL_PLUS);  // Plus icon for add
+    lv_obj_set_style_text_font(add_label, &lv_font_montserrat_12, 0);
+    lv_obj_center(add_label);
+    lv_obj_add_event_cb(add_btn, add_playlist_event_cb, LV_EVENT_CLICKED, NULL);
+    musicUi.add_playlist_btn = add_btn;
+    musicUi.add_playlist_label = add_label;
+
+    // Repeat button
+    lv_obj_t *repeat_btn = lv_btn_create(secondary_controls);
+    lv_obj_set_size(repeat_btn, 32, 24);
+    lv_obj_set_style_bg_color(repeat_btn, lv_color_hex(0x404060), 0);
+    lv_obj_set_style_radius(repeat_btn, 4, 0);
+    lv_obj_t *repeat_label = lv_label_create(repeat_btn);
+    lv_label_set_text(repeat_label, LV_SYMBOL_LOOP);
+    lv_obj_set_style_text_font(repeat_label, &lv_font_montserrat_12, 0);
+    lv_obj_center(repeat_label);
+    lv_obj_add_event_cb(repeat_btn, repeat_event_cb, LV_EVENT_CLICKED, NULL);
+    musicUi.repeat_btn = repeat_btn;
+    musicUi.repeat_label = repeat_label;
+    musicUi.repeat_state = 0;  // 0=off, 1=track, 2=context
 
     // Controls: back / play-pause / next - at bottom
     lv_obj_t *controls = lv_obj_create(card);
@@ -1194,6 +1333,47 @@ void ui_update(const SystemData &sys, const MediaData &med) {
         if (musicUi.play_pause_label && med.isPlaying != musicUi.is_playing) {
             musicUi.is_playing = med.isPlaying;
             lv_label_set_text(musicUi.play_pause_label, med.isPlaying ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        }
+        
+        // Update shuffle button state (highlight when active)
+        if (musicUi.shuffle_btn) {
+            bool shuffle_active = med.shuffle;
+            if (shuffle_active != musicUi.shuffle_state) {
+                musicUi.shuffle_state = shuffle_active;
+                if (shuffle_active) {
+                    // Active: bright green
+                    lv_obj_set_style_bg_color(musicUi.shuffle_btn, lv_palette_main(LV_PALETTE_GREEN), 0);
+                } else {
+                    // Inactive: default gray
+                    lv_obj_set_style_bg_color(musicUi.shuffle_btn, lv_color_hex(0x404060), 0);
+                }
+            }
+        }
+        
+        // Update repeat button state and icon (0=off, 1=track, 2=context)
+        if (musicUi.repeat_btn && musicUi.repeat_label) {
+            if (med.repeat != musicUi.repeat_state) {
+                musicUi.repeat_state = med.repeat;
+                
+                if (musicUi.repeat_state == 1) {
+                    // Repeat one track - orange highlight + "1" indicator
+                    lv_obj_set_style_bg_color(musicUi.repeat_btn, lv_palette_main(LV_PALETTE_ORANGE), 0);
+                    lv_label_set_text(musicUi.repeat_label, "1");
+                } else if (musicUi.repeat_state == 2) {
+                    // Repeat playlist/context - cyan highlight
+                    lv_obj_set_style_bg_color(musicUi.repeat_btn, lv_palette_main(LV_PALETTE_CYAN), 0);
+                    lv_label_set_text(musicUi.repeat_label, LV_SYMBOL_LOOP);
+                } else {
+                    // Off - default gray
+                    lv_obj_set_style_bg_color(musicUi.repeat_btn, lv_color_hex(0x404060), 0);
+                    lv_label_set_text(musicUi.repeat_label, LV_SYMBOL_LOOP);
+                }
+            }
+        }
+        
+        // Reset add-to-playlist button color (in case it was highlighted)
+        if (musicUi.add_playlist_btn) {
+            lv_obj_set_style_bg_color(musicUi.add_playlist_btn, lv_color_hex(0x404060), 0);
         }
         
         // Show/hide artwork placeholder based on whether we have displayed artwork

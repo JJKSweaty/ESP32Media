@@ -122,12 +122,31 @@ void setup() {
     Serial.println("Setup complete.");
 }
 
+// Heap monitoring
+static uint32_t lastHeapLog = 0;
+static size_t minHeapSeen = 999999;
+
 void loop() {
     lv_tick_inc(5);
     lv_timer_handler();
     
     // Smooth progress bar interpolation (call frequently)
     ui_tick();
+    
+    // Periodic heap monitoring (every 30 seconds)
+    uint32_t now = millis();
+    if (now - lastHeapLog > 30000) {
+        lastHeapLog = now;
+        size_t freeHeap = ESP.getFreeHeap();
+        size_t minFree = ESP.getMinFreeHeap();
+        if (freeHeap < minHeapSeen) minHeapSeen = freeHeap;
+        Serial.printf("[HEAP] Free: %d, Min: %d, Session Min: %d\n", freeHeap, minFree, minHeapSeen);
+        
+        // Warn if heap is getting low
+        if (freeHeap < 30000) {
+            Serial.println("[HEAP] WARNING: Low memory!");
+        }
+    }
 
     SnapshotMsg msg;
     if (data_model_try_dequeue(msg)) {
@@ -150,9 +169,13 @@ void loop() {
             med.artist = String(msg.artist);
             med.album = String(msg.album);
             med.source = String(msg.source);
+            med.trackUri = String(msg.trackUri);
             med.position = msg.position;
             med.duration = msg.duration;
             med.isPlaying = msg.isPlaying;
+            med.shuffle = msg.shuffle;
+            med.repeat = msg.repeat;
+            med.isLiked = msg.isLiked;
             med.valid = true;
             
             // Artwork is decoded directly into global buffer by data_model
@@ -177,6 +200,9 @@ void loop() {
             med.artworkUpdated = false;
             med.hasQueue = false;
             med.hasPlaylist = false;
+            med.shuffle = false;
+            med.repeat = 0;
+            med.isLiked = false;
         }
 
         ui_update(sys, med);

@@ -81,9 +81,17 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
     // Check if this is a standalone artwork message
     if (input.indexOf("artwork_b64") > 0 && input.indexOf("cpu_percent") < 0) {
         // This is just artwork - parse and decode it, don't update msg
+        // Check heap before large allocation to avoid crash
+        size_t freeHeap = ESP.getFreeHeap();
+        if (freeHeap < 50000) {
+            Serial.printf("[DATA] Low heap (%d), skipping artwork\n", freeHeap);
+            return false;
+        }
+        
         DynamicJsonDocument doc(32768);
         DeserializationError err = deserializeJson(doc, input);
         if (err) {
+            Serial.printf("[DATA] Artwork JSON error: %s\n", err.c_str());
             return false;
         }
         if (doc.containsKey("artwork_b64")) {
@@ -197,9 +205,13 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
     msg.artist[0] = '\0';
     msg.album[0]  = '\0';
     msg.source[0] = '\0';
+    msg.trackUri[0] = '\0';
     msg.position  = 0;
     msg.duration  = 0;
     msg.isPlaying = false;
+    msg.shuffle = false;
+    msg.repeat = 0;
+    msg.isLiked = false;
     
     // Initialize queue/playlist
     msg.hasQueue = false;
@@ -216,17 +228,30 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
         String artist = String(media["artist"]  | "");
         String album  = String(media["album"]   | "");
         String source = String(media["source"]  | "");
+        String trackUri = String(media["track_uri"] | "");
         int pos       = media["position_seconds"]  | 0;
         int dur       = media["duration_seconds"]  | 0;
         bool playing  = media["is_playing"] | false;
+        bool shuffle  = media["shuffle"] | false;
+        bool isLiked  = media["is_liked"] | false;
+        
+        // Parse repeat state: "off", "track", "context"
+        String repeatStr = String(media["repeat"] | "off");
+        uint8_t repeat = 0;  // off
+        if (repeatStr == "track") repeat = 1;
+        else if (repeatStr == "context") repeat = 2;
 
         safeStrCopy(msg.title,  sizeof(msg.title),  title);
         safeStrCopy(msg.artist, sizeof(msg.artist), artist);
         safeStrCopy(msg.album,  sizeof(msg.album),  album);
         safeStrCopy(msg.source, sizeof(msg.source), source);
+        safeStrCopy(msg.trackUri, sizeof(msg.trackUri), trackUri);
         msg.position = pos;
         msg.duration = dur;
         msg.isPlaying = playing;
+        msg.shuffle = shuffle;
+        msg.repeat = repeat;
+        msg.isLiked = isLiked;
         msg.hasMedia = true;
         
         // Parse playlist context if present
@@ -322,9 +347,22 @@ void data_model_init() {
     }
 }
 
+// Global command throttle to prevent memory issues from rapid commands
+static uint32_t gLastCommandMs = 0;
+static const uint32_t COMMAND_MIN_INTERVAL_MS = 150;  // Min 150ms between commands
+
 // Non-blocking command send - sends via Serial immediately (most reliable)
 void send_command(const char* cmd) {
     if (!cmd) return;
+    
+    // Throttle commands to prevent heap fragmentation from rapid clicks
+    uint32_t now = millis();
+    if (now - gLastCommandMs < COMMAND_MIN_INTERVAL_MS) {
+        Serial.println("[CMD] Throttled");
+        return;
+    }
+    gLastCommandMs = now;
+    
     // Ensure newline termination
     size_t len = strlen(cmd);
     bool has_newline = (len > 0 && cmd[len - 1] == '\n');
@@ -369,11 +407,29 @@ static uint16_t gTcpPort = 5555;
 static void wifi_task(void *pvParameters) {
     (void) pvParameters;
     
-    // Buffer for incoming TCP data
+    // Buffer for incoming TCP data - use a more conservative size
     String lineBuf;
-    lineBuf.reserve(8192);
+    lineBuf.reserve(18000);  // ~18KB for artwork messages
+    
+    // Stability counters
+    uint32_t reconnectCount = 0;
+    uint32_t lastHeapCheck = 0;
     
     for (;;) {
+        // Feed watchdog and check heap periodically
+        uint32_t now = millis();
+        if (now - lastHeapCheck > 10000) {
+            lastHeapCheck = now;
+            size_t freeHeap = ESP.getFreeHeap();
+            if (freeHeap < 30000) {
+                Serial.printf("[WIFI] Low heap: %d bytes\\n", freeHeap);
+                // Force garbage collection by clearing buffer
+                lineBuf = "";
+                lineBuf.reserve(18000);
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        }
+        
         // Check WiFi connection
         if (WiFi.status() != WL_CONNECTED) {
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -384,56 +440,85 @@ static void wifi_task(void *pvParameters) {
         WiFiClient client;
         
         if (!client.connect(gTcpHost, gTcpPort)) {
+            reconnectCount++;
+            if (reconnectCount % 10 == 0) {
+                Serial.printf("[WIFI] Connection failed %d times\\n", reconnectCount);
+            }
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
+        
+        reconnectCount = 0;  // Reset on successful connect
+        Serial.println("[WIFI] Connected to server");
         
         client.setTimeout(1);
         client.setNoDelay(true);
         lineBuf = "";
         
+        uint32_t lastActivity = millis();
+        
         while (client.connected() && WiFi.status() == WL_CONNECTED) {
+            // Watchdog: disconnect if no activity for 30 seconds
+            if (millis() - lastActivity > 30000) {
+                Serial.println("[WIFI] No activity, reconnecting...");
+                break;
+            }
+            
             // === SEND QUEUED COMMANDS (non-blocking) ===
             char cmdBuf[CMD_MAX_LEN];
-            while (gCommandQueue && xQueueReceive(gCommandQueue, cmdBuf, 0) == pdTRUE) {
+            if (gCommandQueue && xQueueReceive(gCommandQueue, cmdBuf, 0) == pdTRUE) {
                 size_t len = strlen(cmdBuf);
                 if (len > 0) {
                     client.print(cmdBuf);
                     if (cmdBuf[len-1] != '\n') {
                         client.print('\n');
                     }
+                    lastActivity = millis();
                 }
             }
             
             // === READ INCOMING DATA ===
-            while (client.available() > 0) {
-                char c = (char)client.read();
+            int available = client.available();
+            if (available > 0) {
+                lastActivity = millis();
                 
-                if (c == '\n') {
-                    String line = lineBuf;
-                    lineBuf = "";
-                    line.trim();
+                // Read in chunks for efficiency
+                while (client.available() > 0) {
+                    char c = (char)client.read();
                     
-                    if (line.length() > 5) {
-                        SnapshotMsg msg;
-                        if (parse_json_into_msg(line, msg)) {
-                            if (gSnapshotQueue) {
-                                xQueueOverwrite(gSnapshotQueue, &msg);
+                    if (c == '\n') {
+                        if (lineBuf.length() > 5) {
+                            // Check heap before parsing
+                            size_t freeHeap = ESP.getFreeHeap();
+                            if (freeHeap > 40000 || lineBuf.indexOf("artwork_b64") < 0) {
+                                SnapshotMsg msg;
+                                if (parse_json_into_msg(lineBuf, msg)) {
+                                    if (gSnapshotQueue) {
+                                        xQueueOverwrite(gSnapshotQueue, &msg);
+                                    }
+                                }
+                            } else {
+                                Serial.printf("[WIFI] Skipping message, low heap: %d\\n", freeHeap);
                             }
                         }
-                    }
-                } else if (c != '\r') {
-                    lineBuf += c;
-                    if (lineBuf.length() > 65535) {
                         lineBuf = "";
+                    } else if (c != '\r') {
+                        lineBuf += c;
+                        // Prevent runaway memory usage
+                        if (lineBuf.length() > 22000) {
+                            Serial.println("[WIFI] Line too long, clearing");
+                            lineBuf = "";
+                        }
                     }
                 }
             }
             
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(pdMS_TO_TICKS(10));  // Slightly longer delay for stability
         }
         
         client.stop();
+        lineBuf = "";  // Clear buffer on disconnect
+        Serial.println("[WIFI] Disconnected, will retry...");
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
@@ -452,7 +537,7 @@ void start_wifi_task(const char* host, uint16_t port) {
     xTaskCreatePinnedToCore(
         wifi_task,
         "WiFiTask",
-        12288,      // 12KB stack
+        24576,      // 24KB stack - needs room for JSON parsing + String ops
         nullptr,
         1,          // priority
         nullptr,

@@ -60,9 +60,15 @@ struct MediaData {
     int duration = 0;    // seconds
     bool isPlaying = false;
     String source;       // "spotify", "youtube", "browser"
+    String trackUri;     // Spotify track URI for like/unlike
 
     bool hasArtwork = false;
     bool artworkUpdated = false;  // Set true when new artwork is ready
+    
+    // Spotify playback state
+    bool shuffle = false;
+    uint8_t repeat = 0;  // 0=off, 1=track (repeat one), 2=context (repeat all)
+    bool isLiked = false;
 
     // Queue data
     bool hasQueue = false;
@@ -90,9 +96,15 @@ typedef struct {
     char artist[64];
     char album[64];
     char source[16];     // Media source
+    char trackUri[80];   // Spotify track URI for like/unlike
     int position;
     int duration;
     bool isPlaying;
+    
+    // Spotify playback state
+    bool shuffle;
+    uint8_t repeat;      // 0=off, 1=track, 2=context
+    bool isLiked;
     
     bool hasArtwork;       // Indicates artwork was parsed
     bool artworkUpdated;   // Indicates new artwork in global buffer
