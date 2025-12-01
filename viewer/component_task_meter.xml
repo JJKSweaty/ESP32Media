@@ -1,4 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<component xmlns="http://lvgl.io/xml/ui/1.0" id="task_meter_card">
-  <obj id="meter_card_root" style="dark_card" width="125" height="185"/>
-</component>

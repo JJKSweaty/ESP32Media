@@ -12,6 +12,9 @@
 #include "data_model.h"
 #include "ui.h"
 
+// Increase Arduino loop task stack size (default is 8KB, we need more for LVGL 9)
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 // --- Touch pins for CYD ---
 #define XPT2046_IRQ  36
 #define XPT2046_MOSI 32
@@ -27,8 +30,8 @@ SPIClass touchscreenSPI(VSPI);
 XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
 TFT_eSPI tft = TFT_eSPI();
 
-// LVGL 9 display buffer
-static lv_color_t draw_buf[SCREEN_WIDTH * 20];
+// LVGL 9 display buffer - reduced size to save memory
+static lv_color_t draw_buf[SCREEN_WIDTH * 10];
 
 // LVGL 9 display flush callback
 static void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {

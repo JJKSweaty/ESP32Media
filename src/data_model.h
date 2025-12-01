@@ -3,6 +3,11 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
+// RGB565 artwork buffer (80x80 = 12800 bytes)
+#define ARTWORK_WIDTH 80
+#define ARTWORK_HEIGHT 80
+#define ARTWORK_BUF_SIZE (ARTWORK_WIDTH * ARTWORK_HEIGHT * 2)
+
 struct SystemData {
     float cpu = 0.0f;
     float mem = 0.0f;
@@ -19,8 +24,7 @@ struct MediaData {
     int position = 0;    // seconds
     int duration = 0;    // seconds
 
-    String artwork_b64;      // base64 PNG from Python (optional)
-    bool hasArtwork = false; // true if artwork_b64 is valid
+    bool hasArtwork = false; // true if artwork is available
 
     bool valid = false;
 };
@@ -38,6 +42,7 @@ typedef struct {
     char album[64];
     int position;
     int duration;
+    bool hasArtwork;
 } SnapshotMsg;
 
 extern QueueHandle_t gSnapshotQueue;
@@ -45,3 +50,12 @@ extern QueueHandle_t gSnapshotQueue;
 void data_model_init();
 void start_serial_task();
 bool data_model_try_dequeue(SnapshotMsg &msg);
+
+// Artwork handling functions
+void artwork_start();
+void artwork_chunk(const char* hexData, size_t len);
+void artwork_end();
+uint8_t* artwork_get_buffer();
+bool artwork_is_ready();
+size_t artwork_get_size();
+void artwork_clear_ready();

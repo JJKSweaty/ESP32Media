@@ -6,6 +6,7 @@
  */
 
 #include "ui.h"
+#include "data_model.h"
 #include <math.h>
 
 // --- Styles ---
@@ -13,6 +14,10 @@ static lv_style_t style_screen_bg;
 static lv_style_t style_card;
 static lv_style_t style_label_primary;
 static lv_style_t style_label_secondary;
+
+// Canvas buffer for artwork (must be static to persist)
+static lv_color_t canvas_buf[80 * 80];
+static bool gArtworkDisplayed = false;
 
 // --- Task UI holder (using arcs instead of meter in LVGL 9) ---
 struct TaskUI {
@@ -28,7 +33,9 @@ static TaskUI taskUi;
 
 // --- Music UI holder ---
 struct MusicUI {
-    lv_obj_t *art_img;
+    lv_obj_t *art_container;  // Container for artwork
+    lv_obj_t *art_canvas;     // Canvas for actual image
+    lv_obj_t *art_icon;       // Fallback icon label
     lv_obj_t *title_label;
     lv_obj_t *artist_label;
     lv_obj_t *album_label;
@@ -40,15 +47,72 @@ static MusicUI musicUi;
 // Kill button callback for process list
 static void kill_proc_event_cb(lv_event_t *e) {
     lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
-    // First child of list button is the label
-    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    // Find child label
+    lv_obj_t *label = nullptr;
+    uint32_t child_cnt = lv_obj_get_child_cnt(btn);
+    for (uint32_t i = 0; i < child_cnt; ++i) {
+        lv_obj_t *c = lv_obj_get_child(btn, i);
+        if (c && lv_obj_check_type(c, &lv_label_class)) {
+            label = c;
+            break;
+        }
+    }
+    if (!label) {
+        // fallback: try child 0
+        label = lv_obj_get_child(btn, 0);
+    }
     if (label) {
         const char *txt = lv_label_get_text(label);
-        // For now: just print to Serial.
-        // Later you can parse the name and send a command back to Python.
         Serial.print("[UI] Kill requested for: ");
         Serial.println(txt);
+        // Parse a PID at the start like "1234: ..."
+        int pid = 0;
+        if (txt) {
+            // find colon
+            const char *colon = strchr(txt, ':');
+            if (colon) {
+                // parse integer before colon
+                char buf[16];
+                int n = colon - txt;
+                if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+                memcpy(buf, txt, n);
+                buf[n] = '\0';
+                pid = atoi(buf);
+            }
+        }
+        if (pid > 0) {
+            // Send JSON command over serial to host: {"cmd":"kill","pid":1234}\n
+            char out[64];
+            snprintf(out, sizeof(out), "{\"cmd\":\"kill\",\"pid\":%d}\n", pid);
+            Serial.print(out);
+        } else {
+            Serial.println("[UI] Could not parse PID from label.");
+        }
     }
+}
+
+static void play_event_cb(lv_event_t *e) {
+    (void)e;
+    const char *cmd = "{\"cmd\":\"play\"}\n";
+    Serial.print(cmd);
+}
+
+static void pause_event_cb(lv_event_t *e) {
+    (void)e;
+    const char *cmd = "{\"cmd\":\"pause\"}\n";
+    Serial.print(cmd);
+}
+
+static void next_event_cb(lv_event_t *e) {
+    (void)e;
+    const char *cmd = "{\"cmd\":\"next\"}\n";
+    Serial.print(cmd);
+}
+
+static void prev_event_cb(lv_event_t *e) {
+    (void)e;
+    const char *cmd = "{\"cmd\":\"previous\"}\n";
+    Serial.print(cmd);
 }
 
 // Throttle UI updates
@@ -101,16 +165,24 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_obj_set_size(card, 310, 185);
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 2);
 
-    // Artwork placeholder
-    lv_obj_t *art = lv_obj_create(card);
-    lv_obj_set_size(art, 80, 80);
-    lv_obj_align(art, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_style_radius(art, 6, 0);
-    lv_obj_set_style_bg_color(art, lv_color_hex(0x303050), 0);
-    lv_obj_set_style_border_width(art, 0, 0);
+    // Artwork container
+    lv_obj_t *art_container = lv_obj_create(card);
+    lv_obj_set_size(art_container, 80, 80);
+    lv_obj_align(art_container, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_radius(art_container, 6, 0);
+    lv_obj_set_style_bg_color(art_container, lv_color_hex(0x303050), 0);
+    lv_obj_set_style_border_width(art_container, 0, 0);
+    lv_obj_set_style_pad_all(art_container, 0, 0);
+    lv_obj_remove_flag(art_container, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Music icon placeholder
-    lv_obj_t *icon = lv_label_create(art);
+    // Canvas for actual artwork image
+    lv_obj_t *art_canvas = lv_canvas_create(art_container);
+    lv_canvas_set_buffer(art_canvas, canvas_buf, 80, 80, LV_COLOR_FORMAT_RGB565);
+    lv_obj_align(art_canvas, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(art_canvas, LV_OBJ_FLAG_HIDDEN);  // Hidden until we have artwork
+    
+    // Music icon placeholder (shown when no artwork)
+    lv_obj_t *icon = lv_label_create(art_container);
     lv_label_set_text(icon, LV_SYMBOL_AUDIO);
     lv_obj_set_style_text_font(icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(icon, lv_color_hex(0x606080), 0);
@@ -155,12 +227,52 @@ static void build_music_tab(lv_obj_t *parent) {
     lv_label_set_text(time_label, "0:00 / 0:00");
     lv_obj_align(time_label, LV_ALIGN_BOTTOM_MID, 0, -5);
 
-    musicUi.art_img = art;
+    musicUi.art_container = art_container;
+    musicUi.art_canvas = art_canvas;
+    musicUi.art_icon = icon;
     musicUi.title_label = title;
     musicUi.artist_label = artist;
     musicUi.album_label = album;
     musicUi.progress_bar = bar;
     musicUi.progress_label = time_label;
+
+    // Controls: back / play / next
+    lv_obj_t *controls = lv_obj_create(card);
+    lv_obj_remove_style_all(controls);
+    lv_obj_set_size(controls, 260, 32);
+    lv_obj_align(controls, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_layout(controls, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(controls, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(controls, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(controls, 4, 0);
+
+    lv_obj_t *prev_btn = lv_btn_create(controls);
+    lv_obj_set_size(prev_btn, 44, 28);
+    lv_obj_t *prev_label = lv_label_create(prev_btn);
+    lv_label_set_text(prev_label, LV_SYMBOL_PREV);
+    lv_obj_center(prev_label);
+    lv_obj_add_event_cb(prev_btn, prev_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *play_btn = lv_btn_create(controls);
+    lv_obj_set_size(play_btn, 44, 28);
+    lv_obj_t *play_label = lv_label_create(play_btn);
+    lv_label_set_text(play_label, LV_SYMBOL_PLAY);
+    lv_obj_center(play_label);
+    lv_obj_add_event_cb(play_btn, play_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *pause_btn = lv_btn_create(controls);
+    lv_obj_set_size(pause_btn, 44, 28);
+    lv_obj_t *pause_label = lv_label_create(pause_btn);
+    lv_label_set_text(pause_label, LV_SYMBOL_PAUSE);
+    lv_obj_center(pause_label);
+    lv_obj_add_event_cb(pause_btn, pause_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *next_btn = lv_btn_create(controls);
+    lv_obj_set_size(next_btn, 44, 28);
+    lv_obj_t *next_label = lv_label_create(next_btn);
+    lv_label_set_text(next_label, LV_SYMBOL_NEXT);
+    lv_obj_center(next_label);
+    lv_obj_add_event_cb(next_btn, next_event_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // --- TASK TAB --- (using arcs for LVGL 9)
@@ -245,7 +357,7 @@ static void build_task_tab(lv_obj_t *parent) {
     lv_obj_remove_style_all(right_panel);
     lv_obj_add_style(right_panel, &style_card, 0);
     lv_obj_set_size(right_panel, 180, 185);
-    lv_obj_align(right_panel, LV_ALIGN_TOP_RIGHT, -2, 2);
+    lv_obj_align(right_panel, LV_ALIGN_TOP_RIGHT, -2, 0);
 
     lv_obj_t *list_title = lv_label_create(right_panel);
     lv_obj_add_style(list_title, &style_label_secondary, 0);
@@ -341,6 +453,29 @@ void ui_update(const SystemData &sys, const MediaData &med) {
 
     char buf[64];
 
+    // --- Check for new artwork ---
+    if (artwork_is_ready() && musicUi.art_canvas) {
+        // Copy RGB565 data to canvas buffer
+        uint8_t *src = artwork_get_buffer();
+        size_t srcSize = artwork_get_size();
+        
+        if (srcSize == ARTWORK_BUF_SIZE) {
+            // Direct copy - RGB565 data is already in correct format
+            memcpy(canvas_buf, src, srcSize);
+            
+            // Show canvas, hide icon
+            lv_obj_remove_flag(musicUi.art_canvas, LV_OBJ_FLAG_HIDDEN);
+            if (musicUi.art_icon) lv_obj_add_flag(musicUi.art_icon, LV_OBJ_FLAG_HIDDEN);
+            
+            // Invalidate canvas to trigger redraw
+            lv_obj_invalidate(musicUi.art_canvas);
+            
+            gArtworkDisplayed = true;
+            Serial.println("[UI] Artwork displayed");
+        }
+        artwork_clear_ready();  // Mark as consumed
+    }
+
     // --- Tasks ---
     int cpu_i = (int)round(sys.cpu);
     int mem_i = (int)round(sys.mem);
@@ -421,6 +556,13 @@ void ui_update(const SystemData &sys, const MediaData &med) {
             format_time(dur_str, sizeof(dur_str), dur);
             snprintf(buf, sizeof(buf), "%s / %s", pos_str, dur_str);
             lv_label_set_text(musicUi.progress_label, buf);
+        }
+        
+        // Show/hide artwork placeholder based on whether we have displayed artwork
+        if (!gArtworkDisplayed && musicUi.art_icon) {
+            // No artwork yet - show icon
+            lv_obj_remove_flag(musicUi.art_icon, LV_OBJ_FLAG_HIDDEN);
+            if (musicUi.art_canvas) lv_obj_add_flag(musicUi.art_canvas, LV_OBJ_FLAG_HIDDEN);
         }
     }
 }
