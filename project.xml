@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  project.xml
+  LVGL Pro / VSCode project descriptor for ESP32Media
+
+  Purpose:
+    - Registers globals, the main screen, and components for the LVGL extension
+    - Sets LVGL version and target screen size so the preview loads correctly
+
+  Usage:
+    - In the LVGL Pro / LVGL extension, open or import this file as the project descriptor.
+    - The extension will load the listed globals and files and set preview size to 320x240 (LVGL 9.4).
+-->
+<project>
+  <meta>
+    <name>ESP32Media</name>
+    <description>ESP32 Media Tracker - LVGL XML project</description>
+    <lvglVersion>9.4</lvglVersion>
+    <screenWidth>320</screenWidth>
+    <screenHeight>240</screenHeight>
+    <entryFile>screen_main.xml</entryFile>
+    <globalsFile>globals.xml</globalsFile>
+  </meta>
+
+  <files>
+    <!-- Globals (styles, shared constants) -->
+    <globals>globals.xml</globals>
+
+    <!-- Screens -->
+    <screen>screen_main.xml</screen>
+
+    <!-- Components -->
+    <component>component_music_header.xml</component>
+    <component>component_music_progress.xml</component>
+    <component>component_task_meter.xml</component>
+    <component>component_process_row.xml</component>
+  </files>
+
+  <!-- Optional settings that some editors honor -->
+  <settings>
+    <preview>
+      <width>320</width>
+      <height>240</height>
+      <lvglVersion>9.4</lvglVersion>
+      <useGlobals>true</useGlobals>
+      <globalsPath>globals.xml</globalsPath>
+    </preview>
+  </settings>
+</project>
