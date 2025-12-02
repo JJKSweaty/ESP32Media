@@ -404,6 +404,9 @@ void start_serial_task() {
 static const char* gTcpHost = nullptr;
 static uint16_t gTcpPort = 5555;
 
+// Maximum bytes to read per iteration to prevent watchdog timeout
+#define MAX_READ_CHUNK 256
+
 static void wifi_task(void *pvParameters) {
     (void) pvParameters;
     
@@ -416,14 +419,16 @@ static void wifi_task(void *pvParameters) {
     uint32_t lastHeapCheck = 0;
     
     for (;;) {
-        // Feed watchdog and check heap periodically
+        // Always yield at start of main loop - this is critical for watchdog
+        vTaskDelay(pdMS_TO_TICKS(50));  // 50ms delay to ensure other tasks run
+        
+        // Check heap periodically
         uint32_t now = millis();
         if (now - lastHeapCheck > 10000) {
             lastHeapCheck = now;
             size_t freeHeap = ESP.getFreeHeap();
             if (freeHeap < 30000) {
-                Serial.printf("[WIFI] Low heap: %d bytes\\n", freeHeap);
-                // Force garbage collection by clearing buffer
+                Serial.printf("[WIFI] Low heap: %d bytes\n", freeHeap);
                 lineBuf = "";
                 lineBuf.reserve(18000);
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -442,13 +447,13 @@ static void wifi_task(void *pvParameters) {
         if (!client.connect(gTcpHost, gTcpPort)) {
             reconnectCount++;
             if (reconnectCount % 10 == 0) {
-                Serial.printf("[WIFI] Connection failed %d times\\n", reconnectCount);
+                Serial.printf("[WIFI] Connection failed %d times\n", reconnectCount);
             }
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
         
-        reconnectCount = 0;  // Reset on successful connect
+        reconnectCount = 0;
         Serial.println("[WIFI] Connected to server");
         
         client.setTimeout(1);
@@ -458,13 +463,16 @@ static void wifi_task(void *pvParameters) {
         uint32_t lastActivity = millis();
         
         while (client.connected() && WiFi.status() == WL_CONNECTED) {
-            // Watchdog: disconnect if no activity for 30 seconds
+            // CRITICAL: Always yield to prevent watchdog - use longer delay
+            vTaskDelay(pdMS_TO_TICKS(20));
+            
+            // Activity timeout
             if (millis() - lastActivity > 30000) {
                 Serial.println("[WIFI] No activity, reconnecting...");
                 break;
             }
             
-            // === SEND QUEUED COMMANDS (non-blocking) ===
+            // === SEND QUEUED COMMANDS ===
             char cmdBuf[CMD_MAX_LEN];
             if (gCommandQueue && xQueueReceive(gCommandQueue, cmdBuf, 0) == pdTRUE) {
                 size_t len = strlen(cmdBuf);
@@ -482,42 +490,48 @@ static void wifi_task(void *pvParameters) {
             if (available > 0) {
                 lastActivity = millis();
                 
-                // Read in chunks for efficiency
-                while (client.available() > 0) {
+                // Only read a small chunk per iteration
+                int toRead = (available > MAX_READ_CHUNK) ? MAX_READ_CHUNK : available;
+                
+                for (int i = 0; i < toRead && client.available() > 0; i++) {
                     char c = (char)client.read();
                     
                     if (c == '\n') {
                         if (lineBuf.length() > 5) {
-                            // Check heap before parsing
+                            // Yield before heavy parsing
+                            vTaskDelay(pdMS_TO_TICKS(1));
+                            
                             size_t freeHeap = ESP.getFreeHeap();
-                            if (freeHeap > 40000 || lineBuf.indexOf("artwork_b64") < 0) {
+                            bool isArtwork = lineBuf.indexOf("artwork_b64") > 0;
+                            
+                            // Skip artwork if low memory
+                            if (freeHeap > 40000 || !isArtwork) {
                                 SnapshotMsg msg;
                                 if (parse_json_into_msg(lineBuf, msg)) {
                                     if (gSnapshotQueue) {
                                         xQueueOverwrite(gSnapshotQueue, &msg);
                                     }
                                 }
+                                // Yield after parsing
+                                vTaskDelay(pdMS_TO_TICKS(1));
                             } else {
-                                Serial.printf("[WIFI] Skipping message, low heap: %d\\n", freeHeap);
+                                Serial.printf("[WIFI] Skip artwork, heap: %d\n", freeHeap);
                             }
                         }
                         lineBuf = "";
                     } else if (c != '\r') {
                         lineBuf += c;
-                        // Prevent runaway memory usage
                         if (lineBuf.length() > 22000) {
-                            Serial.println("[WIFI] Line too long, clearing");
+                            Serial.println("[WIFI] Line overflow, clearing");
                             lineBuf = "";
                         }
                     }
                 }
             }
-            
-            vTaskDelay(pdMS_TO_TICKS(10));  // Slightly longer delay for stability
         }
         
         client.stop();
-        lineBuf = "";  // Clear buffer on disconnect
+        lineBuf = "";
         Serial.println("[WIFI] Disconnected, will retry...");
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
@@ -533,15 +547,16 @@ void start_wifi_task(const char* host, uint16_t port) {
     // Try to auto-connect to saved networks
     wifiMgr.autoConnect();
     
-    // Start the WiFi task
+    // Start the WiFi task on Core 1 (same as loop) to avoid cross-core issues
+    // Use lower priority so main loop takes precedence
     xTaskCreatePinnedToCore(
         wifi_task,
         "WiFiTask",
-        24576,      // 24KB stack - needs room for JSON parsing + String ops
+        24576,      // 24KB stack
         nullptr,
-        1,          // priority
+        0,          // Lower priority than loopTask (priority 1)
         nullptr,
-        0           // core 0
+        1           // Core 1 - same as loopTask to avoid WDT on Core 0
     );
 }
 
