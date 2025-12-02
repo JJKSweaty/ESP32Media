@@ -204,6 +204,12 @@ void loop() {
             med.repeat = 0;
             med.isLiked = false;
         }
+        
+        // Copy Discord voice call state (independent of media)
+        med.hasDiscord = msg.hasDiscord;
+        if (msg.hasDiscord) {
+            med.discord = msg.discord;
+        }
 
         ui_update(sys, med);
     }

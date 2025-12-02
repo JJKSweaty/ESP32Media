@@ -10,6 +10,7 @@
 #include "wifi_manager.h"
 #include <math.h>
 #include <WiFi.h>
+#include <cctype>
 
 // --- Styles ---
 static lv_style_t style_screen_bg;
@@ -76,6 +77,64 @@ static MusicUI musicUi;
 static char gLastQueueItems[MAX_QUEUE_ITEMS][MAX_STR_ESP];
 static uint8_t gLastQueueLen = 255;
 
+// --- Discord UI holder ---
+// Colors matching Discord's design
+#define DISCORD_BLURPLE     0x5865F2
+#define DISCORD_GREEN       0x3BA55D
+#define DISCORD_RED         0xED4245
+#define DISCORD_YELLOW      0xFAA61A
+#define DISCORD_DARK_BG     0x2F3136
+#define DISCORD_DARKER_BG   0x202225
+#define DISCORD_LIGHT_TEXT  0xDCDDDE
+
+// Soundboard sounds (predefined list)
+#define MAX_SOUNDBOARD_SOUNDS 8
+static const char* soundboard_names[MAX_SOUNDBOARD_SOUNDS] = {
+    "Airhorn", "Sad Trombone", "Cricket", "Rimshot",
+    "Golf Clap", "Quack", "Fart", "Ba Dum Tss"
+};
+
+struct DiscordUserUI {
+    lv_obj_t *container;       // Row container for this user
+    lv_obj_t *avatar_circle;   // Avatar circle (colored + initials)
+    lv_obj_t *initials_label;  // Initials in avatar
+    lv_obj_t *name_label;      // Username label
+    lv_obj_t *status_label;    // Status text (Speaking, Muted, etc)
+    lv_obj_t *mute_btn;        // Per-user mute button
+    lv_obj_t *deaf_btn;        // Per-user deafen button
+    uint8_t user_index;        // Index for callbacks
+};
+
+struct DiscordUI {
+    // Main containers
+    lv_obj_t *card;            // Main card
+    lv_obj_t *not_connected_container;  // "Not connected" state
+    lv_obj_t *not_in_call_container;    // "Not in call" state  
+    lv_obj_t *in_call_container;        // Active call UI
+    
+    // Header (36px)
+    lv_obj_t *header;
+    lv_obj_t *discord_icon;
+    lv_obj_t *channel_label;
+    lv_obj_t *soundboard_btn;   // Opens soundboard popup
+    lv_obj_t *connection_pill;  // Green/yellow/red indicator
+    
+    // Participants list (fills remaining space)
+    lv_obj_t *user_list;
+    DiscordUserUI users[MAX_DISCORD_USERS];
+    
+    // Soundboard popup
+    lv_obj_t *soundboard_popup;
+    lv_obj_t *soundboard_btns[MAX_SOUNDBOARD_SOUNDS];
+    
+    // State cache
+    bool last_in_call;
+    bool last_connected;
+    char last_channel[DISCORD_CHANNEL_LEN];
+    uint8_t last_user_count;
+};
+static DiscordUI discordUi;
+
 // Command buffer size (must match data_model.h)
 #define CMD_MAX_LEN 128
 
@@ -110,6 +169,46 @@ static void kill_proc_event_cb(lv_event_t *e) {
             char out[CMD_MAX_LEN];
             snprintf(out, sizeof(out), "{\"cmd\":\"kill\",\"pid\":%d}\n", pid);
             send_command(out);
+        }
+    }
+}
+
+// Discord per-user mute callback (server mute)
+static void discord_user_mute_cb(lv_event_t *e) {
+    uint8_t idx = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+    char out[CMD_MAX_LEN];
+    snprintf(out, sizeof(out), "{\"cmd\":\"discord_user_mute\",\"idx\":%d}\n", idx);
+    send_command(out);
+}
+
+// Discord per-user deafen callback (server deafen)
+static void discord_user_deaf_cb(lv_event_t *e) {
+    uint8_t idx = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+    char out[CMD_MAX_LEN];
+    snprintf(out, sizeof(out), "{\"cmd\":\"discord_user_deafen\",\"idx\":%d}\n", idx);
+    send_command(out);
+}
+
+// Discord soundboard play callback
+static void discord_soundboard_cb(lv_event_t *e) {
+    uint8_t sound_idx = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+    char out[CMD_MAX_LEN];
+    snprintf(out, sizeof(out), "{\"cmd\":\"discord_soundboard\",\"sound\":%d}\n", sound_idx);
+    send_command(out);
+    // Close the soundboard popup
+    if (discordUi.soundboard_popup) {
+        lv_obj_add_flag(discordUi.soundboard_popup, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Toggle soundboard popup visibility
+static void discord_soundboard_toggle_cb(lv_event_t *e) {
+    (void)e;
+    if (discordUi.soundboard_popup) {
+        if (lv_obj_has_flag(discordUi.soundboard_popup, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_remove_flag(discordUi.soundboard_popup, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(discordUi.soundboard_popup, LV_OBJ_FLAG_HIDDEN);
         }
     }
 }
@@ -726,15 +825,277 @@ static void build_discord_tab(lv_obj_t *parent) {
     lv_obj_add_style(parent, &style_screen_bg, 0);
     lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Main card - fills most of the tab
     lv_obj_t *card = lv_obj_create(parent);
-    lv_obj_add_style(card, &style_card, 0);
-    lv_obj_set_size(card, 300, 160);
-    lv_obj_center(card);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, 310, 180);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(DISCORD_DARK_BG), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    discordUi.card = card;
 
-    lv_obj_t *label = lv_label_create(card);
-    lv_obj_add_style(label, &style_label_primary, 0);
-    lv_label_set_text(label, "Discord\nComing soon");
-    lv_obj_center(label);
+    // ========== NOT CONNECTED STATE ==========
+    lv_obj_t *not_conn = lv_obj_create(card);
+    lv_obj_remove_style_all(not_conn);
+    lv_obj_set_size(not_conn, 310, 180);
+    lv_obj_center(not_conn);
+    lv_obj_add_flag(not_conn, LV_OBJ_FLAG_HIDDEN);
+    discordUi.not_connected_container = not_conn;
+    
+    lv_obj_t *nc_label = lv_label_create(not_conn);
+    lv_label_set_text(nc_label, "Discord not connected");
+    lv_obj_set_style_text_color(nc_label, lv_color_hex(0x72767D), 0);
+    lv_obj_set_style_text_font(nc_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(nc_label);
+
+    // ========== NOT IN CALL STATE ==========
+    lv_obj_t *not_call = lv_obj_create(card);
+    lv_obj_remove_style_all(not_call);
+    lv_obj_set_size(not_call, 310, 180);
+    lv_obj_center(not_call);
+    discordUi.not_in_call_container = not_call;
+    
+    lv_obj_t *big_icon = lv_label_create(not_call);
+    lv_label_set_text(big_icon, LV_SYMBOL_CALL);
+    lv_obj_set_style_text_color(big_icon, lv_color_hex(DISCORD_BLURPLE), 0);
+    lv_obj_set_style_text_font(big_icon, &lv_font_montserrat_28, 0);
+    lv_obj_align(big_icon, LV_ALIGN_CENTER, 0, -20);
+    
+    lv_obj_t *nic_label = lv_label_create(not_call);
+    lv_label_set_text(nic_label, "Not in a voice call");
+    lv_obj_set_style_text_color(nic_label, lv_color_hex(DISCORD_LIGHT_TEXT), 0);
+    lv_obj_set_style_text_font(nic_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(nic_label, LV_ALIGN_CENTER, 0, 15);
+    
+    lv_obj_t *hint_label = lv_label_create(not_call);
+    lv_label_set_text(hint_label, "Join a channel from Discord");
+    lv_obj_set_style_text_color(hint_label, lv_color_hex(0x72767D), 0);
+    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_10, 0);
+    lv_obj_align(hint_label, LV_ALIGN_CENTER, 0, 35);
+
+    // ========== IN CALL STATE ==========
+    lv_obj_t *in_call = lv_obj_create(card);
+    lv_obj_remove_style_all(in_call);
+    lv_obj_set_size(in_call, 310, 180);
+    lv_obj_align(in_call, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(in_call, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(in_call, LV_OBJ_FLAG_SCROLLABLE);
+    discordUi.in_call_container = in_call;
+
+    // --- HEADER BAR (36px) with self controls ---
+    lv_obj_t *header = lv_obj_create(in_call);
+    lv_obj_remove_style_all(header);
+    lv_obj_set_size(header, 306, 36);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 2);
+    lv_obj_set_style_bg_color(header, lv_color_hex(DISCORD_DARKER_BG), 0);
+    lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(header, 6, 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    discordUi.header = header;
+    
+    // Discord icon on left
+    lv_obj_t *discord_lbl = lv_label_create(header);
+    lv_label_set_text(discord_lbl, LV_SYMBOL_CALL);
+    lv_obj_set_style_text_color(discord_lbl, lv_color_hex(DISCORD_BLURPLE), 0);
+    lv_obj_set_style_text_font(discord_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(discord_lbl, LV_ALIGN_LEFT_MID, 6, 0);
+    discordUi.discord_icon = discord_lbl;
+    
+    // Channel name
+    lv_obj_t *chan_lbl = lv_label_create(header);
+    lv_label_set_text(chan_lbl, "# Voice");
+    lv_obj_set_style_text_color(chan_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(chan_lbl, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(chan_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(chan_lbl, 100);
+    lv_obj_align(chan_lbl, LV_ALIGN_LEFT_MID, 24, 0);
+    discordUi.channel_label = chan_lbl;
+    
+    // Connection pill (green dot)
+    lv_obj_t *conn_pill = lv_obj_create(header);
+    lv_obj_remove_style_all(conn_pill);
+    lv_obj_set_size(conn_pill, 8, 8);
+    lv_obj_set_style_bg_color(conn_pill, lv_color_hex(DISCORD_GREEN), 0);
+    lv_obj_set_style_bg_opa(conn_pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(conn_pill, 4, 0);
+    lv_obj_align(conn_pill, LV_ALIGN_LEFT_MID, 130, 0);
+    discordUi.connection_pill = conn_pill;
+    
+    // Soundboard button (music note icon) - moved to right side
+    lv_obj_t *sb_btn = lv_btn_create(header);
+    lv_obj_set_size(sb_btn, 28, 28);
+    lv_obj_set_style_bg_color(sb_btn, lv_color_hex(DISCORD_BLURPLE), 0);
+    lv_obj_set_style_radius(sb_btn, 4, 0);
+    lv_obj_set_style_pad_all(sb_btn, 0, 0);
+    lv_obj_align(sb_btn, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_add_event_cb(sb_btn, discord_soundboard_toggle_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sb_icon = lv_label_create(sb_btn);
+    lv_label_set_text(sb_icon, LV_SYMBOL_AUDIO);  // Music note
+    lv_obj_set_style_text_font(sb_icon, &lv_font_montserrat_12, 0);
+    lv_obj_center(sb_icon);
+    discordUi.soundboard_btn = sb_btn;
+
+    // --- PARTICIPANTS LIST (fills remaining ~140px) ---
+    lv_obj_t *user_list = lv_obj_create(in_call);
+    lv_obj_remove_style_all(user_list);
+    lv_obj_set_size(user_list, 306, 138);
+    lv_obj_align(user_list, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_layout(user_list, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(user_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(user_list, 3, 0);
+    lv_obj_set_style_pad_top(user_list, 2, 0);
+    lv_obj_add_flag(user_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(user_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(user_list, LV_SCROLLBAR_MODE_OFF);
+    discordUi.user_list = user_list;
+
+    // Avatar colors for users
+    static const uint32_t avatar_colors[] = {
+        0x5865F2, 0x3BA55D, 0xFAA61A, 0xED4245, 0x9B59B6
+    };
+    
+    for (int i = 0; i < MAX_DISCORD_USERS; i++) {
+        // User row - 32px tall
+        lv_obj_t *row = lv_obj_create(user_list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, 300, 32);
+        lv_obj_set_style_bg_color(row, lv_color_hex(DISCORD_DARKER_BG), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(row, 4, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        discordUi.users[i].container = row;
+        discordUi.users[i].user_index = i;
+
+        // Avatar circle (left, 26x26)
+        lv_obj_t *avatar = lv_obj_create(row);
+        lv_obj_remove_style_all(avatar);
+        lv_obj_set_size(avatar, 26, 26);
+        lv_obj_set_style_bg_color(avatar, lv_color_hex(avatar_colors[i % 5]), 0);
+        lv_obj_set_style_bg_opa(avatar, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(avatar, 13, 0);
+        lv_obj_align(avatar, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_obj_remove_flag(avatar, LV_OBJ_FLAG_SCROLLABLE);
+        discordUi.users[i].avatar_circle = avatar;
+        
+        // Initials in avatar
+        lv_obj_t *initials = lv_label_create(avatar);
+        lv_label_set_text(initials, "??");
+        lv_obj_set_style_text_color(initials, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(initials, &lv_font_montserrat_10, 0);
+        lv_obj_center(initials);
+        discordUi.users[i].initials_label = initials;
+
+        // Name label
+        lv_obj_t *name = lv_label_create(row);
+        lv_label_set_text(name, "Username");
+        lv_obj_set_style_text_color(name, lv_color_hex(DISCORD_LIGHT_TEXT), 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_12, 0);
+        lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name, 120);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 34, -5);
+        discordUi.users[i].name_label = name;
+        
+        // Status label (under name)
+        lv_obj_t *status = lv_label_create(row);
+        lv_label_set_text(status, "");
+        lv_obj_set_style_text_color(status, lv_color_hex(0x72767D), 0);
+        lv_obj_set_style_text_font(status, &lv_font_montserrat_10, 0);
+        lv_obj_align(status, LV_ALIGN_LEFT_MID, 34, 8);
+        discordUi.users[i].status_label = status;
+
+        // Per-user mute button
+        lv_obj_t *user_mute = lv_btn_create(row);
+        lv_obj_set_size(user_mute, 26, 26);
+        lv_obj_set_style_bg_color(user_mute, lv_color_hex(0x4F545C), 0);
+        lv_obj_set_style_radius(user_mute, 4, 0);
+        lv_obj_set_style_pad_all(user_mute, 0, 0);
+        lv_obj_align(user_mute, LV_ALIGN_RIGHT_MID, -34, 0);
+        lv_obj_add_event_cb(user_mute, discord_user_mute_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t *um_icon = lv_label_create(user_mute);
+        lv_label_set_text(um_icon, LV_SYMBOL_VOLUME_MAX);
+        lv_obj_set_style_text_font(um_icon, &lv_font_montserrat_10, 0);
+        lv_obj_center(um_icon);
+        discordUi.users[i].mute_btn = user_mute;
+
+        // Per-user deafen button
+        lv_obj_t *user_deaf = lv_btn_create(row);
+        lv_obj_set_size(user_deaf, 26, 26);
+        lv_obj_set_style_bg_color(user_deaf, lv_color_hex(0x4F545C), 0);
+        lv_obj_set_style_radius(user_deaf, 4, 0);
+        lv_obj_set_style_pad_all(user_deaf, 0, 0);
+        lv_obj_align(user_deaf, LV_ALIGN_RIGHT_MID, -4, 0);
+        lv_obj_add_event_cb(user_deaf, discord_user_deaf_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t *ud_icon = lv_label_create(user_deaf);
+        lv_label_set_text(ud_icon, LV_SYMBOL_AUDIO);
+        lv_obj_set_style_text_font(ud_icon, &lv_font_montserrat_10, 0);
+        lv_obj_center(ud_icon);
+        discordUi.users[i].deaf_btn = user_deaf;
+    }
+
+    // ========== SOUNDBOARD POPUP (overlay) ==========
+    lv_obj_t *sb_popup = lv_obj_create(card);
+    lv_obj_remove_style_all(sb_popup);
+    lv_obj_set_size(sb_popup, 290, 160);
+    lv_obj_center(sb_popup);
+    lv_obj_set_style_bg_color(sb_popup, lv_color_hex(DISCORD_DARKER_BG), 0);
+    lv_obj_set_style_bg_opa(sb_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(sb_popup, 8, 0);
+    lv_obj_set_style_border_color(sb_popup, lv_color_hex(DISCORD_BLURPLE), 0);
+    lv_obj_set_style_border_width(sb_popup, 2, 0);
+    lv_obj_add_flag(sb_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(sb_popup, LV_OBJ_FLAG_SCROLLABLE);
+    discordUi.soundboard_popup = sb_popup;
+    
+    // Soundboard title
+    lv_obj_t *sb_title = lv_label_create(sb_popup);
+    lv_label_set_text(sb_title, "Soundboard");
+    lv_obj_set_style_text_color(sb_title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(sb_title, &lv_font_montserrat_14, 0);
+    lv_obj_align(sb_title, LV_ALIGN_TOP_MID, 0, 6);
+    
+    // Close button for soundboard
+    lv_obj_t *sb_close = lv_btn_create(sb_popup);
+    lv_obj_set_size(sb_close, 24, 24);
+    lv_obj_set_style_bg_color(sb_close, lv_color_hex(DISCORD_RED), 0);
+    lv_obj_set_style_radius(sb_close, 4, 0);
+    lv_obj_align(sb_close, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_add_event_cb(sb_close, discord_soundboard_toggle_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_icon = lv_label_create(sb_close);
+    lv_label_set_text(close_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(close_icon, &lv_font_montserrat_10, 0);
+    lv_obj_center(close_icon);
+    
+    // Grid of sound buttons (4x2)
+    for (int i = 0; i < MAX_SOUNDBOARD_SOUNDS; i++) {
+        int col = i % 4;
+        int row_idx = i / 4;
+        
+        lv_obj_t *sound_btn = lv_btn_create(sb_popup);
+        lv_obj_set_size(sound_btn, 65, 50);
+        lv_obj_set_style_bg_color(sound_btn, lv_color_hex(0x4F545C), 0);
+        lv_obj_set_style_radius(sound_btn, 6, 0);
+        lv_obj_set_pos(sound_btn, 8 + col * 70, 28 + row_idx * 58);
+        lv_obj_add_event_cb(sound_btn, discord_soundboard_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        
+        lv_obj_t *sound_lbl = lv_label_create(sound_btn);
+        lv_label_set_text(sound_lbl, soundboard_names[i]);
+        lv_obj_set_style_text_font(sound_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(sound_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_long_mode(sound_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(sound_lbl, 60);
+        lv_obj_center(sound_lbl);
+        
+        discordUi.soundboard_btns[i] = sound_btn;
+    }
+
+    // Initialize cache
+    discordUi.last_in_call = false;
+    discordUi.last_connected = true;
+    discordUi.last_channel[0] = '\0';
+    discordUi.last_user_count = 0;
 }
 
 // --- SETTINGS TAB with Network Info ---
@@ -1496,6 +1857,114 @@ void ui_update(const SystemData &sys, const MediaData &med) {
                 }
                 gLastQueueLen = med.queueLen;
             }
+        }
+    }
+
+    // --- Discord Voice Call UI ---
+    // Three states: 1) Not connected (no Discord data), 2) Connected but not in call, 3) In call
+    if (med.hasDiscord) {
+        const DiscordState &dc = med.discord;
+        
+        // State change detection
+        bool stateChanged = (dc.inCall != discordUi.last_in_call) || 
+                           (!discordUi.last_connected && med.hasDiscord);
+        
+        if (stateChanged) {
+            discordUi.last_in_call = dc.inCall;
+            discordUi.last_connected = true;
+            
+            if (dc.inCall) {
+                // State: IN CALL - show in_call_container
+                lv_obj_add_flag(discordUi.not_connected_container, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(discordUi.not_in_call_container, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_remove_flag(discordUi.in_call_container, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                // State: NOT IN CALL - show not_in_call_container
+                lv_obj_add_flag(discordUi.not_connected_container, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_remove_flag(discordUi.not_in_call_container, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(discordUi.in_call_container, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        
+        if (dc.inCall) {
+            // Update channel name with # prefix
+            if (strcmp(dc.channelName, discordUi.last_channel) != 0) {
+                strncpy(discordUi.last_channel, dc.channelName, DISCORD_CHANNEL_LEN - 1);
+                discordUi.last_channel[DISCORD_CHANNEL_LEN - 1] = '\0';
+                char chan_buf[DISCORD_CHANNEL_LEN + 4];
+                snprintf(chan_buf, sizeof(chan_buf), "# %s", dc.channelName);
+                lv_label_set_text(discordUi.channel_label, chan_buf);
+            }
+            
+            // Update user list
+            uint8_t userCount = dc.userCount;
+            if (userCount > MAX_DISCORD_USERS) userCount = MAX_DISCORD_USERS;
+            
+            for (int i = 0; i < MAX_DISCORD_USERS; i++) {
+                if (i < userCount) {
+                    lv_obj_remove_flag(discordUi.users[i].container, LV_OBJ_FLAG_HIDDEN);
+                    
+                    // Update username
+                    lv_label_set_text(discordUi.users[i].name_label, dc.users[i].name);
+                    
+                    // Generate initials (first 2 chars, uppercase)
+                    char initials[3] = "??";
+                    if (strlen(dc.users[i].name) > 0) {
+                        initials[0] = toupper(dc.users[i].name[0]);
+                        if (strlen(dc.users[i].name) > 1) {
+                            initials[1] = toupper(dc.users[i].name[1]);
+                        } else {
+                            initials[1] = '\0';
+                        }
+                        initials[2] = '\0';
+                    }
+                    lv_label_set_text(discordUi.users[i].initials_label, initials);
+                    
+                    // Update status text based on speaking/muted/deafened
+                    if (dc.users[i].speaking) {
+                        lv_label_set_text(discordUi.users[i].status_label, "Speaking...");
+                        lv_obj_set_style_text_color(discordUi.users[i].status_label, lv_color_hex(DISCORD_GREEN), 0);
+                        // Green ring around avatar when speaking
+                        lv_obj_set_style_border_color(discordUi.users[i].avatar_circle, lv_color_hex(DISCORD_GREEN), 0);
+                        lv_obj_set_style_border_width(discordUi.users[i].avatar_circle, 2, 0);
+                    } else if (dc.users[i].deafened) {
+                        lv_label_set_text(discordUi.users[i].status_label, "Deafened");
+                        lv_obj_set_style_text_color(discordUi.users[i].status_label, lv_color_hex(DISCORD_RED), 0);
+                        lv_obj_set_style_border_width(discordUi.users[i].avatar_circle, 0, 0);
+                    } else if (dc.users[i].muted) {
+                        lv_label_set_text(discordUi.users[i].status_label, "Muted");
+                        lv_obj_set_style_text_color(discordUi.users[i].status_label, lv_color_hex(DISCORD_YELLOW), 0);
+                        lv_obj_set_style_border_width(discordUi.users[i].avatar_circle, 0, 0);
+                    } else {
+                        lv_label_set_text(discordUi.users[i].status_label, "");
+                        lv_obj_set_style_border_width(discordUi.users[i].avatar_circle, 0, 0);
+                    }
+                    
+                    // Update per-user mute/deaf button colors
+                    if (dc.users[i].muted) {
+                        lv_obj_set_style_bg_color(discordUi.users[i].mute_btn, lv_color_hex(DISCORD_RED), 0);
+                    } else {
+                        lv_obj_set_style_bg_color(discordUi.users[i].mute_btn, lv_color_hex(0x4F545C), 0);
+                    }
+                    if (dc.users[i].deafened) {
+                        lv_obj_set_style_bg_color(discordUi.users[i].deaf_btn, lv_color_hex(DISCORD_RED), 0);
+                    } else {
+                        lv_obj_set_style_bg_color(discordUi.users[i].deaf_btn, lv_color_hex(0x4F545C), 0);
+                    }
+                } else {
+                    lv_obj_add_flag(discordUi.users[i].container, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+            discordUi.last_user_count = userCount;
+        }
+    } else {
+        // No Discord data - show "not connected" state
+        if (discordUi.last_connected || discordUi.last_in_call) {
+            discordUi.last_connected = false;
+            discordUi.last_in_call = false;
+            lv_obj_remove_flag(discordUi.not_connected_container, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(discordUi.not_in_call_container, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(discordUi.in_call_container, LV_OBJ_FLAG_HIDDEN);
         }
     }
 }

@@ -55,8 +55,11 @@ static bool decodeArtworkB64(const char* b64, size_t b64Len) {
     // Check if it's the same artwork
     uint32_t h = quickHash(b64, b64Len);
     if (h == gLastArtworkHash) {
+        Serial.println("[ARTWORK] Same hash, skipping");
         return false;  // Same artwork, no update needed
     }
+    
+    Serial.printf("[ARTWORK] Decoding %d chars...\n", b64Len);
     
     size_t outLen = 0;
     int ret = mbedtls_base64_decode(
@@ -68,11 +71,13 @@ static bool decodeArtworkB64(const char* b64, size_t b64Len) {
     );
     
     if (ret != 0 || outLen != ARTWORK_RGB565_SIZE) {
+        Serial.printf("[ARTWORK] Decode failed: ret=%d, outLen=%d (expected %d)\n", ret, outLen, ARTWORK_RGB565_SIZE);
         return false;
     }
     
     gLastArtworkHash = h;
     gArtworkNew = true;
+    Serial.printf("[ARTWORK] Decode success! %d bytes, gArtworkNew=true\n", outLen);
     return true;
 }
 
@@ -80,26 +85,50 @@ static bool decodeArtworkB64(const char* b64, size_t b64Len) {
 static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
     // Check if this is a standalone artwork message
     if (input.indexOf("artwork_b64") > 0 && input.indexOf("cpu_percent") < 0) {
-        // This is just artwork - parse and decode it, don't update msg
-        // Check heap before large allocation to avoid crash
-        size_t freeHeap = ESP.getFreeHeap();
-        if (freeHeap < 50000) {
-            Serial.printf("[DATA] Low heap (%d), skipping artwork\n", freeHeap);
+        Serial.printf("[DATA] Received artwork message (%d chars)\n", input.length());
+        
+        // Debug: print first 100 chars of input
+        Serial.printf("[DATA] First 100 chars: %.100s\n", input.c_str());
+        
+        // Extract base64 directly without JSON parsing to save memory
+        // Format: {"artwork_b64":"BASE64DATA"} or {"artwork_b64": "BASE64DATA"}
+        int startIdx = input.indexOf("\"artwork_b64\"");
+        if (startIdx < 0) {
+            Serial.println("[DATA] No artwork_b64 key found");
             return false;
         }
         
-        DynamicJsonDocument doc(32768);
-        DeserializationError err = deserializeJson(doc, input);
-        if (err) {
-            Serial.printf("[DATA] Artwork JSON error: %s\n", err.c_str());
+        // Find the colon after artwork_b64
+        int colonIdx = input.indexOf(":", startIdx);
+        if (colonIdx < 0) {
+            Serial.println("[DATA] No colon after artwork_b64");
             return false;
         }
-        if (doc.containsKey("artwork_b64")) {
-            const char* b64 = doc["artwork_b64"] | "";
-            size_t b64len = strlen(b64);
-            if (b64len > 100) {
-                decodeArtworkB64(b64, b64len);
-            }
+        
+        // Find the opening quote after the colon
+        int quoteIdx = input.indexOf("\"", colonIdx + 1);
+        if (quoteIdx < 0) {
+            Serial.println("[DATA] No opening quote for value");
+            return false;
+        }
+        startIdx = quoteIdx + 1;  // Start of base64 data
+        
+        int endIdx = input.indexOf("\"", startIdx);
+        if (endIdx < 0 || endIdx <= startIdx) {
+            Serial.println("[DATA] Malformed artwork JSON - no closing quote");
+            return false;
+        }
+        
+        size_t b64len = endIdx - startIdx;
+        Serial.printf("[DATA] artwork_b64 length: %d\n", b64len);
+        
+        if (b64len > 100 && b64len < 20000) {
+            // Get pointer to base64 data in the input string
+            const char* b64 = input.c_str() + startIdx;
+            bool ok = decodeArtworkB64(b64, b64len);
+            Serial.printf("[DATA] Artwork decode: %s\n", ok ? "SUCCESS" : "FAILED");
+        } else {
+            Serial.printf("[DATA] artwork_b64 invalid length: %d\n", b64len);
         }
         return false;  // Don't queue this as a snapshot
     }
@@ -300,6 +329,79 @@ static bool parse_json_into_msg(const String &input, SnapshotMsg &msg) {
                     msg.artworkUpdated = true;
                 }
             }
+        }
+    }
+
+    // --- Discord voice call state (optional "discord" object) ---
+    msg.hasDiscord = false;
+    memset(&msg.discord, 0, sizeof(msg.discord));
+    
+    if (doc.containsKey("discord") && doc["discord"].is<JsonObject>()) {
+        JsonObject discord = doc["discord"].as<JsonObject>();
+        
+        // Check if in call - support both "c" (compact) and "in_call" (full)
+        bool inCall = false;
+        if (discord.containsKey("c")) {
+            inCall = discord["c"].as<int>() != 0;
+        } else if (discord.containsKey("in_call")) {
+            inCall = discord["in_call"] | false;
+        }
+        
+        msg.discord.inCall = inCall;
+        
+        if (inCall) {
+            msg.hasDiscord = true;
+            
+            // Channel name - support both "ch" (compact) and "channel" (full)
+            String channelName = "";
+            if (discord.containsKey("ch")) {
+                channelName = String(discord["ch"] | "");
+            } else if (discord.containsKey("channel")) {
+                channelName = String(discord["channel"] | "");
+            }
+            safeStrCopy(msg.discord.channelName, sizeof(msg.discord.channelName), channelName);
+            
+            // Self mute/deaf - support both compact and full
+            msg.discord.selfMuted = discord["sm"] | discord["self_muted"] | false;
+            msg.discord.selfDeafened = discord["sd"] | discord["self_deafened"] | false;
+            
+            // Parse users array - support both "u" (compact) and "users" (full)
+            JsonArray usersArr;
+            if (discord.containsKey("u") && discord["u"].is<JsonArray>()) {
+                usersArr = discord["u"].as<JsonArray>();
+            } else if (discord.containsKey("users") && discord["users"].is<JsonArray>()) {
+                usersArr = discord["users"].as<JsonArray>();
+            }
+            
+            uint8_t idx = 0;
+            for (JsonVariant v : usersArr) {
+                if (idx >= MAX_DISCORD_USERS) break;
+                if (!v.is<JsonObject>()) continue;
+                JsonObject u = v.as<JsonObject>();
+                
+                DiscordUser &user = msg.discord.users[idx];
+                
+                // Name - support both "n" (compact) and "name" (full)
+                String name = "";
+                if (u.containsKey("n")) {
+                    name = String(u["n"] | "");
+                } else if (u.containsKey("name")) {
+                    name = String(u["name"] | "");
+                }
+                safeStrCopy(user.name, sizeof(user.name), name);
+                
+                // Muted - support both "m" (compact) and "muted" (full)
+                user.muted = u["m"] | u["muted"] | false;
+                
+                // Deafened - support both "d" (compact) and "deafened" (full)
+                user.deafened = u["d"] | u["deafened"] | false;
+                
+                // Speaking - support both "s" (compact) and "speaking" (full)
+                user.speaking = u["s"] | u["speaking"] | false;
+                
+                idx++;
+            }
+            msg.discord.userCount = idx;
         }
     }
 

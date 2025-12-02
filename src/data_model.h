@@ -20,6 +20,29 @@
 #define MAX_QUEUE_ITEMS 5
 #define MAX_STR_ESP 48
 
+// Discord voice call limits
+#define MAX_DISCORD_USERS 5
+#define DISCORD_NAME_LEN 16
+#define DISCORD_CHANNEL_LEN 20
+
+// Discord user in voice channel
+struct DiscordUser {
+    char name[DISCORD_NAME_LEN];
+    bool muted;
+    bool deafened;
+    bool speaking;  // Simulated - true if not muted
+};
+
+// Discord voice call state
+struct DiscordState {
+    bool inCall;
+    char channelName[DISCORD_CHANNEL_LEN];
+    bool selfMuted;
+    bool selfDeafened;
+    uint8_t userCount;
+    DiscordUser users[MAX_DISCORD_USERS];
+};
+
 struct SystemData {
     float cpu = 0.0f;
     float mem = 0.0f;
@@ -79,6 +102,10 @@ struct MediaData {
     bool hasPlaylist = false;
     PlaylistInfo playlist;
 
+    // Discord voice call state (for UI convenience)
+    bool hasDiscord = false;
+    DiscordState discord;
+
     bool valid = false;
 };
 
@@ -117,6 +144,10 @@ typedef struct {
     // Playlist context
     bool hasPlaylist;
     PlaylistInfo playlist;
+    
+    // Discord voice call state
+    bool hasDiscord;
+    DiscordState discord;
 } SnapshotMsg;
 
 extern QueueHandle_t gSnapshotQueue;
