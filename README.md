@@ -1,6 +1,6 @@
 # ESP32 Dashboard System
 
-This project is a modular ESP32-based dashboard designed for media playback monitoring, process management, and future Discord integration. It features a touchscreen UI powered by LVGL (v9.4), efficient communication via UART or Wi-Fi, real-time system metrics, music playback with artwork, and queue management.
+This project is a modular ESP32-based dashboard designed for media playback monitoring, process management, and Discord integration. It features a touchscreen UI powered by LVGL (v9.4), efficient communication via UART or Wi-Fi, real-time system metrics, music playback with artwork, and queue management.
 
 ## Features
 
